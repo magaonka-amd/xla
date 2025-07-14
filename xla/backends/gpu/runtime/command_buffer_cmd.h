@@ -43,6 +43,8 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/custom_call_thunk.h"
 #include "xla/backends/gpu/runtime/dynamic_slice_thunk.h"
 #include "xla/backends/gpu/runtime/gpublas_lt_matmul_thunk.h"
+#include "xla/backends/gpu/runtime/collective_permute_thunk.h"
+#include "xla/backends/gpu/runtime/convolution_thunk.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/call_frame.h"
@@ -78,6 +80,7 @@ namespace xla::gpu {
   V(kLaunchCmd, "LaunchCmd")                                     \
   V(kCustomKernelLaunchCmd, "CustomKernelLaunchCmd")             \
   V(kCublasLtCmd, "CublasLtCmd")                                 \
+  V(kConvolutionCmd, "ConvolutionCmd")                   \
   V(kCuDnnCmd, "CuDnnCmd")                                       \
   V(kGemmCmd, "GemmCmd")                                         \
   V(kMemcpyDeviceToDeviceCmd, "MemcpyDeviceToDeviceCmd")         \
@@ -93,6 +96,7 @@ namespace xla::gpu {
   V(kAllToAll, "AllToAllCmd")                                    \
   V(kAllGatherCmd, "AllGatherCmd")                               \
   V(kCollectiveBroadcastCmd, "CollectiveBroadcastCmd")           \
+  V(kCollectivePermuteCmd, "CollectivePermuteCmd")       \
   V(kDynamicSliceFusionCmd, "DynamicSliceFusionCmd")             \
   V(kDynamicSliceCopyFusionCmd, "DynamicSliceCopyFusionCmd")     \
   V(kUnknownCmd, "UnknownCmd") \
@@ -839,6 +843,26 @@ class CublasLtCmd : public TracedCommandBufferCmd, public CublasLtMatmulThunk {
 // CuDnnCmd
 //===----------------------------------------------------------------------===//
 
+class ConvolutionCmd : public TracedCommandBufferCmd,
+                    public ConvolutionThunk {
+ public:
+  ConvolutionCmd(ExecutionStreamId execution_stream_id, 
+              const ConvolutionThunk& conv_thunk,
+              ResourceUseVector resources = {});
+
+  absl::Status Initialize(const Thunk::InitializeParams& params,
+                          StateManager& state) override;
+
+  absl::StatusOr<const se::CommandBuffer::Command*> Record(
+      const Thunk::ExecuteParams& execute_params,
+      const RecordParams& record_params, RecordAction record_action,
+      se::CommandBuffer* command_buffer) override;
+
+  BufferUseVector buffers() const override;
+
+  bool IsNestedCommandBuffer() const final { return true; }
+};
+
 class CuDnnCmd : public TracedCommandBufferCmd {
  public:
   CuDnnCmd(ExecutionStreamId execution_stream_id,
@@ -1057,6 +1081,34 @@ class ReduceScatterCmd : public CollectiveCmd {
 
  private:
   ReductionKind reduction_kind_;
+  std::vector<CollectiveThunk::Buffer> buffers_;
+};
+
+class CollectivePermuteCmd : public CollectiveCmd {
+ public:
+  CollectivePermuteCmd(ExecutionStreamId execution_stream_id,
+              ExecutionStreamId async_from_stream_id,
+              const P2PConfig& config,
+              absl::Span<const CollectiveThunk::Buffer> buffers,
+              ResourceUseVector resources = {});
+
+  absl::StatusOr<const se::CommandBuffer::Command*> Record(
+      const Thunk::ExecuteParams& execute_params,
+      const RecordParams& record_params, RecordAction record_action,
+      se::CommandBuffer* command_buffer) override;
+
+  BufferUseVector buffers() const override;
+
+  AsyncStreamKind GetAsyncStreamKind() override {
+    return AsyncStreamKind::kCollective;
+  };
+
+  CollectiveStreamId GetAsyncStreamId() override {
+    return CollectiveStreamId(1);
+  };
+
+ private:
+  P2PConfig::IdToSourceTargetMap id_to_source_target_;
   std::vector<CollectiveThunk::Buffer> buffers_;
 };
 

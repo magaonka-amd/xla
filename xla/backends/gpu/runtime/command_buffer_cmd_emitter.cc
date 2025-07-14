@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/all_reduce_thunk.h"
 #include "xla/backends/gpu/runtime/all_to_all_thunk.h"
 #include "xla/backends/gpu/runtime/command_buffer_cmd.h"
+#include "xla/backends/gpu/runtime/collective_permute_thunk.h"
 #include "xla/backends/gpu/runtime/conditional_thunk.h"
 #include "xla/backends/gpu/runtime/copy_thunk.h"
 #include "xla/backends/gpu/runtime/cudnn_thunk.h"
@@ -203,6 +204,13 @@ static absl::StatusOr<Command> Convert(const AllToAllStartThunk& thunk,
       thunk.config(), thunk.has_split_dimension(), thunk.buffers(), resources);
 }
 
+static absl::StatusOr<Command> Convert(const CollectivePermuteStartThunk& thunk,
+                                      ResourceUseVector resources) {
+  return std::make_unique<CollectivePermuteCmd>(
+      thunk.nccl_execution_stream_id(), thunk.execution_stream_id(),
+      thunk.p2pconfig(), thunk.buffers(), resources);
+}
+
 static absl::StatusOr<Command> Convert(const AllGatherStartThunk& thunk,
                                        ResourceUseVector resources) {
   return std::make_unique<AllGatherCmd>(
@@ -262,6 +270,12 @@ static absl::StatusOr<Command> Convert(const CuDnnThunk& thunk,
                                        ResourceUseVector resources) {
   return std::make_unique<CuDnnCmd>(
       thunk.execution_stream_id(), thunk.arguments(), thunk.graph(), resources);
+}
+
+static absl::StatusOr<Command> Convert(const ConvolutionThunk& thunk,
+                                      ResourceUseVector resources) {
+  return std::make_unique<ConvolutionCmd>(thunk.execution_stream_id(), thunk, 
+                resources);
 }
 
 //===----------------------------------------------------------------------===//
@@ -326,12 +340,16 @@ static absl::Status AppendCommands(CommandBufferCmdSequence& cmd_sequence,
       return append(Convert<ReduceScatterStartThunk>(thunk, resources));
     case Thunk::Kind::kAllToAllStart:
       return append(Convert<AllToAllStartThunk>(thunk, resources));
+    case Thunk::Kind::kCollectivePermuteStart:
+      return append(Convert<CollectivePermuteStartThunk>(thunk, resources));
     case Thunk::Kind::kPartitionId:
       return append(Convert<PartitionIdThunk>(thunk, resources));
     case Thunk::Kind::kReplicaId:
       return append(Convert<ReplicaIdThunk>(thunk, resources));
     case Thunk::Kind::kWhile:
       return append(Convert<WhileThunk>(thunk, resources, options));
+    case Thunk::Kind::kConvolution:
+      return append(Convert<ConvolutionThunk>(thunk, resources));
     case Thunk::Kind::kCuDnn:
       return append(Convert<CuDnnThunk>(thunk, resources));
     case Thunk::Kind::kDynamicSlice:

@@ -910,10 +910,17 @@ void RocmExecutor::DeallocateStream(Stream* stream) {
 absl::Status RocmExecutor::InitBlas() {
   absl::MutexLock lock(&mu_);
   PluginRegistry* registry = PluginRegistry::Instance();
-  TF_ASSIGN_OR_RETURN(
+  {
+    TF_ASSIGN_OR_RETURN(
       auto factory,
       registry->GetFactory<PluginRegistry::BlasFactory>(rocm::kROCmPlatformId));
-  blas_.reset(factory(this));
+    blas_.reset(factory(this));
+  }
+  {
+    TF_ASSIGN_OR_RETURN(auto factory,
+      registry->GetFactory<PluginRegistry::DnnFactory>(rocm::kROCmPlatformId));
+    dnn_.reset(factory(this));
+  }
   return absl::OkStatus();
 }
 
@@ -924,22 +931,6 @@ blas::BlasSupport* RocmExecutor::AsBlas() {
 
 dnn::DnnSupport* RocmExecutor::AsDnn() {
   absl::MutexLock lock(&mu_);
-  if (dnn_ != nullptr) {
-    return dnn_.get();
-  }
-  PluginRegistry* registry = PluginRegistry::Instance();
-  absl::StatusOr<PluginRegistry::DnnFactory> status =
-      registry->GetFactory<PluginRegistry::DnnFactory>(rocm::kROCmPlatformId);
-  if (!status.ok()) {
-    LOG(ERROR) << "Unable to retrieve DNN factory: "
-               << status.status().message();
-    return nullptr;
-  }
-
-  auto dnn = status.value()(this);
-
-  dnn_.reset(dnn);
-
   return dnn_.get();
 }
 

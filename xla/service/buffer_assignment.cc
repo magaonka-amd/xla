@@ -1501,6 +1501,9 @@ bool BufferAssigner::MaybeAssignBuffer(BufferAllocation* allocation,
     return false;
   }
 
+  // hack hack 
+  return false;
+
   assignment->AddAssignment(allocation, hlo_buffer, /*offset=*/0,
                             assignment->HloBufferSize(hlo_buffer));
   return true;
@@ -1912,6 +1915,7 @@ absl::Status BufferAssigner::AssignBuffersWithSequentialOrdering(
       VLOG(2) << "Simulating heap for color " << color;
       int64_t alignment = assignment->color_alignment_(color);
       HeapSimulator::Options options;
+      options.may_reuse_operand_buffers = false;
       options.alloc_constants = allocate_buffers_for_constants_;
       auto private_stacks_it = private_stacks.find(color);
       if (private_stacks_it != private_stacks.end()) {
@@ -1979,6 +1983,7 @@ absl::Status BufferAssigner::AssignBuffersWithSequentialOrdering(
         VLOG(2) << "Simulating heap for color " << color;
         int64_t alignment = assignment->color_alignment_(color);
         HeapSimulator::Options options;
+        options.may_reuse_operand_buffers = false;
         options.buffers_to_assign = &color_map[color];
         TF_ASSIGN_OR_RETURN(
             HeapSimulator::Result<HloValue> result,

@@ -49,7 +49,10 @@ limitations under the License.
 #include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
+#include "tsl/platform/path.h"
 #include "tsl/platform/casts.h"
+
+#define GPU_GRAPH_API_DEBUG 1
 
 namespace stream_executor::gpu {
 namespace {
@@ -386,9 +389,62 @@ absl::Status RocmCommandBuffer::Trace(
   return absl::OkStatus();
 }
 
+
+#if GPU_GRAPH_API_DEBUG
+static struct FinalPrinter 
+{
+  using GpuGraphHandle = hipGraph_t;
+
+  constexpr static const uint32_t Num = 8;
+  void dump(uint32_t deviceID, GpuGraphHandle graph) {
+    if(deviceID >= Num) {
+      VLOG(1) << "ERROR: wrong deviceID: " << deviceID;
+    }
+    auto& map = graph_map_[deviceID];
+    auto [it, created] = map.emplace(graph, std::tuple{"", 0ull});
+    auto& [name, count] = it->second;
+    if(created) {
+      std::string path = tsl::io::GetTempFilename(/*extension=*/"dot");
+
+      int flags = hipGraphDebugDotFlagsHandles | 
+              hipGraphDebugDotFlagsMemcpyNodeParams |
+              hipGraphDebugDotFlagsMemsetNodeParams;
+      // flags = hipGraphDebugDotFlagsVerbose;
+      auto res = wrap::hipGraphDebugDotPrint(graph, path.c_str(), flags);
+      if(res == hipSuccess) {
+        size_t numNodes = 0;
+        (void)hipGraphGetNodes(graph, /*nodes=*/nullptr, &numNodes);
+        VLOG(1) << "Printed graph to: " << path << " with #nodes " << numNodes;
+      }
+      name = path;
+    }
+    count++;
+  }
+
+  ~FinalPrinter() {
+    int ID = 0;
+    for(const auto& map : graph_map_) {
+      VLOG(1) << "======================= graph stats " << ID++ 
+              << "========================";
+      for(const auto &[id, tuple] : map) {
+        const auto& [name,count] = tuple;
+        VLOG(1) << name << " called " << count << " times";
+      }
+    }
+  }
+private:  
+  using Map = std::unordered_map< GpuGraphHandle, 
+                            std::tuple<std::string, uint64_t> >;
+  std::array< Map, Num > graph_map_{};
+} s_printer;
+#endif // GPU_GRAPH_API_DEBUG
+
 absl::Status RocmCommandBuffer::LaunchGraph(Stream* stream) {
   VLOG(3) << "Launch command buffer executable graph " << exec_
           << " on a stream: " << stream;
+#if GPU_GRAPH_API_DEBUG
+  s_printer.dump(stream->parent()->device_ordinal(), graph_);
+#endif
   return ToStatus(wrap::hipGraphLaunch(
                       exec_, static_cast<hipStream_t>(
                                  stream->platform_specific_handle().stream)),

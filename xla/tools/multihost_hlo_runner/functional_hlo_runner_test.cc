@@ -625,6 +625,75 @@ TEST_F(FunctionalHloRunnerTest, CanCreateMockClientInPjRtEnv) {
   TF_EXPECT_OK(RunShardedHloWithClient(*env.client));
 }
 
+
+// ROCM Error:
+// E0000 00:00:1737155629.780742  137227 pjrt_stream_executor_client.cc:3045] Execution of replica 0 failed: INTERNAL: Failed to end stream capture: hipError_t(901)
+TEST_F(FunctionalHloRunnerTest, shard8) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::PjRtClient> client,
+                          GetPjRtClient());
+
+  constexpr int kRequiredDeviceCount = 8;
+  const int kDeviceCount = client->device_count();
+  if (kDeviceCount < kRequiredDeviceCount) {
+    GTEST_SKIP() << "Requires " << kRequiredDeviceCount
+                 << " devices, but found only " << kDeviceCount;
+    return;
+  }
+
+  // NOTE: debug_options sent to FunctionalHloRunner::LoadAndRunAndDump() get
+  // lost during the creating of XlaComputation from HloModuleProto in
+  // FunctionalHloRunner::Compile
+  xla::DebugOptions debug_options;
+  FunctionalHloRunner::PreprocessingOptions preproc_options;
+  FunctionalHloRunner::RawCompileOptions raw_compile_options;
+  raw_compile_options.spmd_mode =
+      FunctionalHloRunner::SpmdMode::kUseSpmdPartitioning;
+  raw_compile_options.num_replicas = 1;
+  raw_compile_options.num_partitions = 8;
+  FunctionalHloRunner::RunningOptions running_options;
+  running_options.num_repeats = 15;
+  running_options.module_argument_mode =
+      FunctionalHloRunner::ModuleArgumentMode::kUninitialized;
+
+  TF_EXPECT_OK(FunctionalHloRunner::LoadAndRunAndDump(
+      *client, debug_options, preproc_options, raw_compile_options,
+      running_options, {"input.hlo"},
+      InputFormat::kText));
+}
+
+TEST_F(FunctionalHloRunnerTest, shard4) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::PjRtClient> client,
+                          GetPjRtClient());
+
+  constexpr int kRequiredDeviceCount = 4;
+  const int kDeviceCount = client->device_count();
+  if (kDeviceCount < kRequiredDeviceCount) {
+    GTEST_SKIP() << "Requires " << kRequiredDeviceCount
+                 << " devices, but found only " << kDeviceCount;
+    return;
+  }
+
+  // NOTE: debug_options sent to FunctionalHloRunner::LoadAndRunAndDump() get
+  // lost during the creating of XlaComputation from HloModuleProto in
+  // FunctionalHloRunner::Compile
+  xla::DebugOptions debug_options;
+  FunctionalHloRunner::PreprocessingOptions preproc_options;
+  FunctionalHloRunner::RawCompileOptions raw_compile_options;
+  raw_compile_options.spmd_mode =
+      FunctionalHloRunner::SpmdMode::kUseSpmdPartitioning;
+  raw_compile_options.num_replicas = 1;
+  raw_compile_options.num_partitions = 4;
+  FunctionalHloRunner::RunningOptions running_options;
+  running_options.num_repeats = 10;
+  running_options.module_argument_mode =
+      FunctionalHloRunner::ModuleArgumentMode::kUseSharedRandomInputs;
+
+  TF_EXPECT_OK(FunctionalHloRunner::LoadAndRunAndDump(
+      *client, debug_options, preproc_options, raw_compile_options,
+      running_options, {"input.hlo"},
+      InputFormat::kText));
+}
+
 TEST_F(FunctionalHloRunnerTest, Sharded2DevicesHloUnoptimizedSnapshot) {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::PjRtClient> client,
                           GetPjRtClient());

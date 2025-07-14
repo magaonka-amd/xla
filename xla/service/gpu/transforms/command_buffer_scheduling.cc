@@ -132,7 +132,8 @@ static bool AsyncStartOrDoneCommandIsSupported(
   }
 
   if (hlo->async_wrapped_opcode() == HloOpcode::kReduceScatter ||
-      hlo->async_wrapped_opcode() == HloOpcode::kAllToAll) {
+      hlo->async_wrapped_opcode() == HloOpcode::kAllToAll ||
+      hlo->async_wrapped_opcode() == HloOpcode::kCollectivePermute) {
     return config.enabled_commands.contains(DebugOptions::COLLECTIVES);
   }
 
@@ -141,7 +142,8 @@ static bool AsyncStartOrDoneCommandIsSupported(
 
 static bool IsAsyncStartCommand(const HloInstruction* hlo,
                                 const CommandBufferConfig& config) {
-  if (HloPredicateIsOp<HloOpcode::kAllReduceStart, HloOpcode::kAllGatherStart>(
+  if (HloPredicateIsOp<HloOpcode::kAllReduceStart, HloOpcode::kAllGatherStart,
+          HloOpcode::kCollectivePermuteStart>(
           hlo)) {
     return config.enabled_commands.contains(DebugOptions::COLLECTIVES);
   }
@@ -150,7 +152,8 @@ static bool IsAsyncStartCommand(const HloInstruction* hlo,
     return AsyncStartOrDoneCommandIsSupported(hlo, config);
   }
 
-  if (HloPredicateIsOp<HloOpcode::kReduceScatter, HloOpcode::kAllToAll>(hlo)) {
+  if (HloPredicateIsOp<HloOpcode::kReduceScatter, HloOpcode::kAllToAll,
+                        HloOpcode::kCollectivePermute>(hlo)) {
     return config.enabled_commands.contains(DebugOptions::COLLECTIVES);
   }
 
@@ -159,7 +162,8 @@ static bool IsAsyncStartCommand(const HloInstruction* hlo,
 
 static bool IsAsyncDoneCommand(const HloInstruction* hlo,
                                const CommandBufferConfig& config) {
-  if (HloPredicateIsOp<HloOpcode::kAllReduceDone, HloOpcode::kAllGatherDone>(
+  if (HloPredicateIsOp<HloOpcode::kAllReduceDone, HloOpcode::kAllGatherDone,
+         HloOpcode::kCollectivePermuteDone>(
           hlo)) {
     return config.enabled_commands.contains(DebugOptions::COLLECTIVES);
   }
@@ -173,7 +177,8 @@ static bool IsAsyncDoneCommand(const HloInstruction* hlo,
 
 // Finds an async-done HLO operation corresponding on an async-start one.
 static HloInstruction* FindAsyncDoneCommand(const HloInstruction* start) {
-  if (HloPredicateIsOp<HloOpcode::kAllReduceStart, HloOpcode::kAllGatherStart>(
+  if (HloPredicateIsOp<HloOpcode::kAllReduceStart, HloOpcode::kAllGatherStart, 
+            HloOpcode::kCollectivePermuteStart>(
           start)) {
     CHECK(start->users().size() == 1);  // NOLINT, checked by HLO verifier
     return start->users().front();
@@ -235,6 +240,11 @@ static bool IsCommand(const HloCustomCallInstruction* hlo,
       IsCustomCallTofMHA(*hlo)) {
     VLOG(3) << "Recording FusedMHA, target " << hlo->custom_call_target()
             << " into command buffer.";
+    return true;
+  }
+
+  if (config.enabled_commands.contains(DebugOptions::CUDNN) &&
+      IsCustomCallToDnnConvolution(*hlo)) {
     return true;
   }
 

@@ -44,7 +44,7 @@ inline BufferAssigner::Colorer CollectiveColorer(bool use_user_buffers,
                                                  bool use_nvshmem) {
   return [use_user_buffers, use_nvshmem](HloAliasAnalysis* alias_analysis,
                                          const HloOrdering&) {
-    static const absl::NoDestructor<absl::flat_hash_set<HloOpcode>>
+    static const absl::flat_hash_set<HloOpcode>
         kSupportedOpcodes({
             HloOpcode::kAllReduce,
             HloOpcode::kAllReduceStart,
@@ -82,11 +82,11 @@ inline BufferAssigner::Colorer CollectiveColorer(bool use_user_buffers,
     };
     auto is_collective_memory_instr = [&](const HloInstruction* instr) {
       if (use_user_buffers) {
-        return kSupportedOpcodes->contains(instr->opcode()) ||
+        return kSupportedOpcodes.contains(instr->opcode()) ||
                // opcode or async wrapped opcode is in kSupportedOpcodes.
                ((instr->opcode() == HloOpcode::kAsyncStart ||
                  instr->opcode() == HloOpcode::kAsyncDone) &&
-                kSupportedOpcodes->contains(instr->async_wrapped_opcode()));
+                kSupportedOpcodes.contains(instr->async_wrapped_opcode()));
       }
       if (use_nvshmem) {
         return is_mosaic_gpu_nvshmem_instr(instr) || is_nvshmem_op(instr);

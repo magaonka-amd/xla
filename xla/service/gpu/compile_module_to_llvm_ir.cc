@@ -267,7 +267,9 @@ absl::StatusOr<std::unique_ptr<BufferAssignment>> RunBufferAssignment(
   TF_ASSIGN_OR_RETURN(
       std::unique_ptr<BufferAssignment> buffer_assignment,
       BufferAssigner::Run(
-          module, std::make_unique<SequentialHloOrdering>(module->schedule()),
+          module, 
+          std::make_unique<DependencyHloOrdering>(module),
+          //std::make_unique<SequentialHloOrdering>(module->schedule()),
           buffer_size_bytes_function, alias_info,
           /*color_alignment=*/
           [](LogicalBuffer::Color) { return kXlaAllocatedBufferAlignBytes; },

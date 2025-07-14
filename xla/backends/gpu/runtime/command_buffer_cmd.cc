@@ -1409,6 +1409,54 @@ CommandBufferCmd::BufferUseVector CublasLtCmd::buffers() const {
 }
 
 //===----------------------------------------------------------------------===//
+// ConvolutionCmd
+//===----------------------------------------------------------------------===//
+
+ConvolutionCmd::ConvolutionCmd(
+    ExecutionStreamId execution_stream_id, 
+    const ConvolutionThunk& conv_thunk,
+    ResourceUseVector resources)
+    : TracedCommandBufferCmd(CommandBufferCmdType::kConvolutionCmd,
+                             execution_stream_id, std::move(resources)),
+      ConvolutionThunk(conv_thunk) {}
+
+absl::Status ConvolutionCmd::Initialize(const Thunk::InitializeParams& params,
+                                     StateManager& state) {
+  // This shall populate runner cache, unless not yet created
+  TF_RETURN_IF_ERROR(ConvolutionThunk::Initialize(params));
+  return absl::OkStatus();
+}
+
+absl::StatusOr<const se::CommandBuffer::Command*> ConvolutionCmd::Record(
+    const Thunk::ExecuteParams& execute_params,
+    const RecordParams& record_params, RecordAction record_action,
+    se::CommandBuffer* command_buffer) {
+  
+  VLOG(5) << "ConvolutionCmd";
+
+  return RecordTracedCommand(
+      execute_params, record_params, std::move(record_action), command_buffer,
+      [&](se::Stream* stream) {
+        return ExecuteOnStreamInternal(stream, execute_params);
+      });
+}
+
+CommandBufferCmd::BufferUseVector ConvolutionCmd::buffers() const {
+  
+  BufferUseVector buffer_usage;
+  buffer_usage.reserve(operand_buffers_.size() + result_buffers_.size() + 1);
+
+  for (BufferAllocation::Slice buffer : operand_buffers_) {
+    buffer_usage.push_back({buffer, MemoryAccess::kRead});
+  }
+  for (BufferAllocation::Slice buffer : result_buffers_) {
+    buffer_usage.push_back({buffer, MemoryAccess::kWrite});
+  }
+  buffer_usage.push_back({scratch_buffer_, MemoryAccess::kWrite});
+  return buffer_usage;
+}
+
+//===----------------------------------------------------------------------===//
 // CuDnnCmd
 //===----------------------------------------------------------------------===//
 
@@ -1834,6 +1882,80 @@ CommandBufferCmd::BufferUseVector ReduceScatterCmd::buffers() const {
   }
   return buffer_usage;
 }
+
+//===----------------------------------------------------------------------===//
+// CollectivePermuteCmd
+//===----------------------------------------------------------------------===//
+
+CollectivePermuteCmd::CollectivePermuteCmd(ExecutionStreamId execution_stream_id,
+                         ExecutionStreamId async_from_stream_id,
+                         const P2PConfig& config,
+                         absl::Span<const CollectiveThunk::Buffer> buffers,
+                         ResourceUseVector resources)
+    : CollectiveCmd(CommandBufferCmdType::kCollectivePermuteCmd, execution_stream_id,
+                    async_from_stream_id, config.config,
+                    std::move(resources)),
+      id_to_source_target_(config.id_to_source_target),
+      buffers_(buffers.begin(), buffers.end()) {}
+
+absl::StatusOr<const se::CommandBuffer::Command*> CollectivePermuteCmd::Record(
+    const Thunk::ExecuteParams& execute_params,
+    const RecordParams& record_params, RecordAction record_action,
+    se::CommandBuffer* command_buffer) {
+
+  TF_ASSIGN_OR_RETURN(
+      std::vector<DeviceBufferPair> device_buffers,
+      ConvertToDeviceBuffers(execute_params.buffer_allocations, buffers_,
+                             config().operand_element_type));
+
+  for (size_t i = 0; i < device_buffers.size(); ++i) {
+    VLOG(5) << "  Src: " << buffers_[i].source_buffer << " ("
+            << device_buffers[i].source_buffer.opaque() << ")";
+    VLOG(5) << "  Dst: " << buffers_[i].destination_buffer << " ("
+            << device_buffers[i].destination_buffer.opaque() << ")";
+  }
+
+  if (!execute_params.collective_params || !execute_params.collective_cliques) {
+    return absl::InvalidArgumentError(
+        "CollectivePermuteCmd requires collective parameters and cliques");
+  }
+
+  TF_ASSIGN_OR_RETURN(const int64_t current_id,
+                      GetCurrentId(execute_params.collective_params, config()));
+        //GetDeviceString(*params.collective_params);
+
+  const P2PConfig::SourceTargetMapEntry source_target =
+      P2PConfig::GetSourceTarget(id_to_source_target_, current_id);
+
+  VLOG(5) << "CollectivePermuteCmd";
+
+  TF_ASSIGN_OR_RETURN(GpuCollectives * collectives,
+                      Thunk::GetGpuCollectives(execute_params));
+  TF_ASSIGN_OR_RETURN(
+      CommunicatorHandle comm_handle,
+      GetComm(collectives, *execute_params.collective_params,
+              *execute_params.collective_cliques, config().replica_groups,
+              config().group_mode, GetAsyncStreamKind()));
+
+
+  return RecordTracedCommand(
+      execute_params, record_params, std::move(record_action), command_buffer,
+      [&](se::Stream* stream) {
+        return RunCollectivePermute(source_target, device_buffers,
+              *stream, comm_handle.comm, "cmd_buf_collective_permute", current_id, 
+              /*use_memcpy*/false, /*recv_ptr_map*/nullptr);
+      });
+}
+
+CommandBufferCmd::BufferUseVector CollectivePermuteCmd::buffers() const {
+  BufferUseVector buffer_usage;
+  for (auto& buffer : buffers_) {
+    buffer_usage.emplace_back(buffer.source_buffer, MemoryAccess::kRead);
+    buffer_usage.emplace_back(buffer.destination_buffer, MemoryAccess::kWrite);
+  }
+  return buffer_usage;
+}
+
 
 //===----------------------------------------------------------------------===//
 // AllToAllCmd
