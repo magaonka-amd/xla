@@ -264,12 +264,18 @@ absl::StatusOr<std::unique_ptr<BufferAssignment>> RunBufferAssignment(
           ? std::optional<BufferValue::Color>(kTempBufferMemorySpaceColor)
           : std::nullopt;
 
+  using HloOrderingPtr = std::unique_ptr<HloOrdering>;
+  auto hlo_ordering = 
+      options.xla_gpu_graph_enable_concurrent_region() 
+        ? static_cast<HloOrderingPtr>(
+                     std::make_unique<DependencyHloOrdering>(module))
+        : static_cast<HloOrderingPtr>(
+              std::make_unique<SequentialHloOrdering>(module->schedule()));
+
   TF_ASSIGN_OR_RETURN(
       std::unique_ptr<BufferAssignment> buffer_assignment,
       BufferAssigner::Run(
-          module, 
-          std::make_unique<DependencyHloOrdering>(module),
-          //std::make_unique<SequentialHloOrdering>(module->schedule()),
+          module, std::move(hlo_ordering),
           buffer_size_bytes_function, alias_info,
           /*color_alignment=*/
           [](LogicalBuffer::Color) { return kXlaAllocatedBufferAlignBytes; },
