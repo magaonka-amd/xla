@@ -460,7 +460,12 @@ CommandBufferScheduling::CollectCommandBufferSequences(
   int64_t num_commands_in_current_seq = 0;
 
   // Adds `current_seq` to `sequences` if it has enough commands in it.
-  auto collect_current_seq = [&]() {
+  auto collect_current_seq = [&](const HloInstruction *instr) {
+    if(num_commands_in_current_seq > 0)
+    VLOG(1) << num_commands_in_current_seq << " seq length stopped at: " 
+            << (instr ? instr->ToString() : "<end>") 
+            << " min_num_commands: " << min_num_commands; 
+
     if (num_commands_in_current_seq >= std::max(1, min_num_commands)) {
       RemoveTrailingNoOps(current_seq);
       sequences.push_back(std::move(current_seq));
@@ -605,11 +610,11 @@ CommandBufferScheduling::CollectCommandBufferSequences(
 
     // If we didn't find the next command, collect the current sequence and
     // start a new one.
-    collect_current_seq();
+    collect_current_seq(inst);
   }
 
   // Don't forget to collect the final command sequence.
-  collect_current_seq();
+  collect_current_seq(nullptr);
   return sequences;
 }
 

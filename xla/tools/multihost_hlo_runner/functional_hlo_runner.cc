@@ -653,12 +653,13 @@ absl::StatusOr<PerDeviceLiteralVecType> RunInternal(
             total++;
             if (std::isfinite(value)) {
               finite++;
-              ssum += value;
+              ssum += (double)value;
             }
           });
-        VLOG(0) << repeat << ": device_id: " << device_id << "  total: " << total << 
-            " finite: " << finite << " ssum " << std::hex << 
-              reinterpret_cast< uint64_t& >(ssum) << std::dec;
+        VLOG(0) << repeat << ": dev" << device_id << " finite: " << finite
+            << '/' << total << " sum: " 
+            << std::setprecision(12) << (ssum/1e6) << std::hex
+            << " (" << reinterpret_cast< uint64_t& >(ssum) << ')' << std::dec;
         
       }
     } // for literal
@@ -1227,11 +1228,14 @@ absl::Status LoadAndRunAndDump(
       CompileOptions compile_options,
       FunctionalHloRunner::CreateCompileOptions(client, raw_compile_options,
                                                 task_id, num_nodes, kv_store));
+  std::minstd_rand0 engine(7777);
+  VLOG(0) << "Setting engine " << (&engine);
+
   TF_ASSIGN_OR_RETURN(
       FunctionalHloRunner::PerDeviceLiteralVecType output,
       FunctionalHloRunner::LoadAndRun(client, debug_options, preproc_options,
                                       compile_options, running_options,
-                                      hlo_file, input_format));
+                                      hlo_file, input_format, {}, &engine));
   return dump_output_to.empty()
              ? absl::OkStatus()
              : FunctionalHloRunner::DumpOutput(output, dump_output_to, task_id);

@@ -684,9 +684,9 @@ TEST_F(FunctionalHloRunnerTest, shard4) {
   raw_compile_options.num_replicas = 1;
   raw_compile_options.num_partitions = 4;
   FunctionalHloRunner::RunningOptions running_options;
-  running_options.num_repeats = 10;
+  running_options.num_repeats = 100;
   running_options.module_argument_mode =
-      FunctionalHloRunner::ModuleArgumentMode::kUseSharedRandomInputs;
+      FunctionalHloRunner::ModuleArgumentMode::kUseRandomInputs;
 
   TF_EXPECT_OK(FunctionalHloRunner::LoadAndRunAndDump(
       *client, debug_options, preproc_options, raw_compile_options,
