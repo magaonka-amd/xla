@@ -332,6 +332,7 @@ xla_test(
         "//xla:literal",
         "//xla:status_macros",
         "//xla:types",
+        "//xla/tests:test_utils",
         "//xla:util",
         "//xla:xla_data_proto_cc",
         "//xla/ffi",

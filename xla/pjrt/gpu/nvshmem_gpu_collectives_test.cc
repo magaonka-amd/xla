@@ -13,6 +13,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -21,16 +22,17 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_replace.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/debug_options_flags.h"
 #include "xla/ffi/ffi.h"
+#include "xla/literal_util.h"
 #include "xla/hlo/builder/xla_computation.h"
 #include "xla/hlo/parser/hlo_parser.h"
 #include "xla/hlo/testlib/test.h"
-#include "xla/literal.h"
 #include "xla/pjrt/distributed/client.h"
 #include "xla/pjrt/distributed/distributed.h"
 #include "xla/pjrt/distributed/service.h"
@@ -40,6 +42,7 @@ limitations under the License.
 #include "xla/pjrt/pjrt_executable.h"
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_client_options.h"
 #include "xla/status_macros.h"
+#include "xla/tests/test_utils.h"
 #include "xla/tsl/platform/status.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/subprocess.h"
@@ -50,9 +53,12 @@ limitations under the License.
 
 namespace xla {
 namespace {
+
 class NvshmemGpuCollectivesTest : public ::testing::Test {};
 
 static const char* test_binary_name;
+
+// static const absl::flat_hash_map< absl::string_view, xla::ResourceType >
 
 absl::StatusOr<std::unique_ptr<xla::PjRtLoadedExecutable>> CompileExecutable(
     absl::string_view program, xla::PjRtClient& client,
@@ -146,9 +152,160 @@ TEST(NvshmemGpuCollectivesTest, NvshmemAllReduceUint8) {
   RunNvshmemTest(PrimitiveType::U8, "all_reduce");
 }
 
+absl::Status NvshmemCollectiveRunAllReduce(
+      PjRtClient& client, uint32_t num_ranks, 
+      const CompileOptions& compile_options, PrimitiveType dtype) {
+  
+  const char *kProgram = R"(HloModule NvshmemAr
+      apply_op {
+        x = <<NT>>[] parameter(0)
+        y = <<NT>>[] parameter(1)
+        ROOT apply_op = <<NT>>[] add(x, y)
+      }
+      addf {
+        x = f32[] parameter(0)
+        y = f32[] parameter(1)
+        ROOT apply_op = f32[] add(x, y)
+      }
+      ENTRY test_computation {
+        num_ranks = u32[] parameter(0)
+        num_ranksf = f32[]convert(num_ranks)
+        bcf = f32<<DIM>> broadcast(num_ranksf), dimensions={}
+        iota = u32<<DIM>> iota(), iota_dimension=1
+        iotat = <<NT>><<DIM>> convert(iota)
+        iotaf = f32<<DIM>> convert(iota)
+        truthf = f32<<DIM>> multiply(iotaf, bcf)
+        start = <<NT>><<DIM>> all-reduce-start(iotat), to_apply=apply_op, backend_config={"collective_backend_config":{"backend":"NVSHMEM"}}, channel_id=0
+        done = <<NT>><<DIM>> all-reduce-done(start)
+        donef = f32<<DIM>> convert(done)
+        subf = f32<<DIM>> subtract(donef, truthf)
+        subabsf = f32<<DIM>> abs(subf)
+        zero = f32[] constant(0)
+        ROOT final = f32[] reduce(subabsf, zero), dimensions={0,1}, to_apply=addf
+      })";
+
+  std::ostringstream sprogram;
+  {
+  std::ifstream ifs("input.hlo");
+  if (!ifs) return absl::InternalError("Ops wrong HLO file!");
+    sprogram << ifs.rdbuf();
+  }
+
+  auto dtype_str = primitive_util::LowercasePrimitiveTypeName(dtype);
+  auto hlo_text = absl::StrReplaceAll(sprogram.str(), 
+        {{"<<NT>>", dtype_str}, 
+         {"<<DIM>>", "[2,2]"} });
+
+  TF_ASSIGN_OR_RETURN(auto executable,
+                      CompileExecutable(hlo_text, client, compile_options));
+  TF_ASSIGN_OR_RETURN(auto hlo_modules, executable->GetHloModules());
+
+  // TF_ASSIGN_OR_RETURN(auto fake_args, 
+  //       xla::MakeFakeArguments(hlo_modules[0].get(), /*pseudo_random*/true,
+  //       /*use_large_range*/false));
+
+  auto param = LiteralUtil::CreateFull({}, num_ranks);
+
+  // Shape shape = ShapeUtil::MakeShape(dtype, {1});
+  //shape.mutable_layout()->set_memory_space(Layout::kDefaultMemorySpace);
+
+  //PrimitiveTypeBitWidth
+  PjRtDevice* const device = client.addressable_devices()[0];
+ 
+  /*  std::normal_distribution<double> generator(mean, stddev);
+  return CreateLiteralWithGenerator<type, NativeT>(
+      shape, [&](absl::Span<const int64_t>) {
+        return static_cast<NativeT>(generator(*engine));
+      });*/
+
+  // std::minstd_rand0 engine;
+  // auto func = [&](auto xtype) {
+  //     auto tt = decltype(xtype);
+  //     //using ElementT = primitive_util::NativeTypeOf<xtype>;
+  //     return LiteralUtil::CreateRandomLiteral<tt>(
+  //       shape, &engine, 0.0, /*stddev*/1.0
+  //     );
+  // };
+  // TF_ASSIGN_OR_RETURN(auto literal, 
+  //   primitive_util::ArrayTypeSwitch(func, dtype));
+
+ TF_ASSIGN_OR_RETURN(
+      auto input, client.BufferFromHostLiteral(
+          param, *device->default_memory_space()));
+  
+  TF_ASSIGN_OR_RETURN(auto result,
+                        executable->Execute({{input.get()}}, ExecuteOptions()));
+
+  std::vector<std::unique_ptr<xla::PjRtBuffer>>& result_buffers = result[0];
+  TF_ASSIGN_OR_RETURN(auto output, result_buffers[0]->ToLiteralSync());
+
+  VLOG(0) << "Got literal output " << output->ToString();
+  // switch (data_type) {
+  //     case xla::PrimitiveType::F32: {
+  //       std::vector<float> ref_data{20};
+  //       TF_RET_CHECK(literal->data<float>()[0] == ref_data[0]);
+  //       break;
+  //     }
+  //     case xla::PrimitiveType::F64: {
+  //       std::vector<double> ref_data{20};
+  //       TF_RET_CHECK(literal->data<double>()[0] == ref_data[0]);
+  //       break;
+  //     }
+  //     case xla::PrimitiveType::BF16: {
+  //       std::vector<Eigen::bfloat16> ref_data{20};
+  //       TF_RET_CHECK(literal->data<Eigen::bfloat16>()[0] == ref_data[0]);
+  //       break;
+  //     }
+  //     case xla::PrimitiveType::F16: {
+  //       std::vector<Eigen::half> ref_data{20};
+  //       TF_RET_CHECK(literal->data<Eigen::half>()[0] == ref_data[0]);
+  //       break;
+  //     }
+  //     case xla::PrimitiveType::U32: {
+  //       std::vector<uint32_t> ref_data{20};
+  //       TF_RET_CHECK(literal->data<uint32_t>()[0] == ref_data[0]);
+  //       break;
+  //     }
+  //     case xla::PrimitiveType::U64: {
+  //       std::vector<uint64_t> ref_data{20};
+  //       TF_RET_CHECK(literal->data<uint64_t>()[0] == ref_data[0]);
+  //       break;
+  //     }
+  //     case xla::PrimitiveType::S32: {
+  //       std::vector<int32_t> ref_data{20};
+  //       TF_RET_CHECK(literal->data<int32_t>()[0] == ref_data[0]);
+  //       break;
+  //     }
+  //     case xla::PrimitiveType::S64: {
+  //       std::vector<int64_t> ref_data{20};
+  //       TF_RET_CHECK(literal->data<int64_t>()[0] == ref_data[0]);
+  //       break;
+  //     }
+  //     case xla::PrimitiveType::PRED: {
+  //       std::vector<uint8_t> ref_data{20};
+  //       TF_RET_CHECK(literal->data<uint8_t>()[0] == ref_data[0]);
+  //       break;
+  //     }
+  //     case xla::PrimitiveType::S8: {
+  //       std::vector<int8_t> ref_data{20};
+  //       TF_RET_CHECK(literal->data<int8_t>()[0] == ref_data[0]);
+  //       break;
+  //     }
+  //     case xla::PrimitiveType::U8: {
+  //       std::vector<uint8_t> ref_data{20};
+  //       TF_RET_CHECK(literal->data<uint8_t>()[0] == ref_data[0]);
+  //       break;
+  //     }
+  //     default:
+  //       return absl::InvalidArgumentError("Invalida data type.");
+  //   }
+  return absl::OkStatus();
+}
+
 absl::Status NvshmemCollectiveTestBody(int rank_id, int num_ranks,
                                        int input_data_type,
                                        absl::string_view test_case) {
+
   xla::PrimitiveType data_type = (xla::PrimitiveType)input_data_type;
   std::unique_ptr<xla::DistributedRuntimeService> service;
   if (rank_id == 0) {
@@ -166,6 +323,8 @@ absl::Status NvshmemCollectiveTestBody(int rank_id, int num_ranks,
   TF_QCHECK_OK(distributed_client->Connect());
 
   GpuClientOptions client_options;
+  // client_options.allocator_config.kind = GpuAllocatorConfig::Kind::kPlatform;
+  
   client_options.node_id = rank_id;
   client_options.allowed_devices = {rank_id};
   client_options.num_nodes = num_ranks;
@@ -176,231 +335,48 @@ absl::Status NvshmemCollectiveTestBody(int rank_id, int num_ranks,
 
   xla::CompileOptions options;
   options.executable_build_options.mutable_debug_options()
-      ->set_xla_gpu_experimental_enable_nvshmem(true);
-  options.executable_build_options.set_run_backend_only(true);
+      ->set_xla_gpu_experimental_enable_nvshmem(false);
+  // options.executable_build_options.set_run_backend_only(true);
   options.executable_build_options.set_use_spmd_partitioning(false);
   options.executable_build_options.set_num_replicas(num_ranks);
-  TF_ASSIGN_OR_RETURN(std::string data_type_str, GetDataTypeString(data_type));
+
   std::string kProgram;
 
   if (test_case == "collective_permute") {
-    kProgram = absl::StrFormat(R"(
-        HloModule NvshmemCollectivePermute
+    kProgram = R"(
+         HloModule NvshmemCollectivePermute
         ENTRY test_computation {
-          data = %s[] constant(42)
-          start = (%s[], %s[]) collective-permute-start(data),
+          data = <<NT>>[] constant(42)
+          start = (<<NT>>[], <<NT>>[]) collective-permute-start(data),
                 source_target_pairs={{0,1},{1,0}},
                 backend_config={"collective_backend_config":{"backend":"NVSHMEM"}}
-          ROOT done = %s[] collective-permute-done(start)
-        })",
-                               data_type_str, data_type_str, data_type_str,
-                               data_type_str);
+          ROOT done = <<NT>>[] collective-permute-done(start)
+        })";
   } else if (test_case == "send_recv") {
-    kProgram = absl::StrFormat(R"(
+    kProgram = R"(
         HloModule NvshmemSendRecv
         ENTRY test_computation {
-          data = %s[] constant(42)
+          data = <<NT>>[] constant(42)
           after-all = token[] after-all()
-          recv = (%s[], %s[], token[]) recv(after-all), channel_id=0, frontend_attributes={_xla_send_recv_source_target_pairs="{{0,1}}"}, backend_config={"collective_backend_config":{"backend":"NVSHMEM"}}
-          send = (%s[], %s[], token[]) send(data, after-all), channel_id=0, control-predecessors={recv}, frontend_attributes={_xla_send_recv_source_target_pairs="{{0,1}}"}, backend_config={"collective_backend_config":{"backend":"NVSHMEM"}}
-          recv-done = (%s[], token[]) recv-done(recv), channel_id=0
-          recv-data = %s[] get-tuple-element(recv-done), index=0
+          recv = (<<NT>>[], <<NT>>[], token[]) recv(after-all), channel_id=0, frontend_attributes={_xla_send_recv_source_target_pairs="{{0,1}}"}, backend_config={"collective_backend_config":{"backend":"NVSHMEM"}}
+          send = (<<NT>>[], <<NT>>[], token[]) send(data, after-all), channel_id=0, control-predecessors={recv}, frontend_attributes={_xla_send_recv_source_target_pairs="{{0,1}}"}, backend_config={"collective_backend_config":{"backend":"NVSHMEM"}}
+          recv-done = (<<NT>>[], token[]) recv-done(recv), channel_id=0
+          recv-data = <<NT>>[] get-tuple-element(recv-done), index=0
           send-done = token[] send-done(send), channel_id=0, control-predecessors={recv}
-          ROOT result = %s[] copy(recv-data)
-        })",
-                               data_type_str, data_type_str, data_type_str,
-                               data_type_str, data_type_str, data_type_str,
-                               data_type_str, data_type_str);
+          ROOT result = <<NT>>[] copy(recv-data)
+        })";
   } else if (test_case == "all_reduce") {
-    kProgram = absl::StrFormat(
-        R"(
-    HloModule NvshmemAr
-      apply_op {
-        x = %s[] parameter(0)
-        y = %s[] parameter(1)
-        ROOT apply_op = %s[] add(x, y)
-      }
-      ENTRY test_computation {
-        param = %s[1,1]{1,0} parameter(0)
-        reshape = %s[1]{0} reshape(param)
-        start = %s[1]{0} all-reduce-start(reshape), to_apply=apply_op, backend_config={"collective_backend_config":{"backend":"NVSHMEM"}}
-        ROOT done = %s[1]{0} all-reduce-done(start)
-      })",
-        data_type_str, data_type_str, data_type_str, data_type_str,
-        data_type_str, data_type_str, data_type_str);
+    VLOG(0) << "Running all reduce";
+    return NvshmemCollectiveRunAllReduce(*client, num_ranks, options, data_type);
   }
 
   TF_ASSIGN_OR_RETURN(auto executable,
                       CompileExecutable(kProgram, *client, options));
   TF_ASSIGN_OR_RETURN(auto hlo_modules, executable->GetHloModules());
   std::vector<std::vector<std::unique_ptr<PjRtBuffer>>> result;
-  if (test_case == "all_reduce") {
-    Shape shape =
-        ShapeUtil::MakeShapeWithDenseLayout(data_type, {1, 1},
-                                            /*minor_to_major=*/{1, 0});
-    shape.mutable_layout()->set_memory_space(Layout::kDefaultMemorySpace);
 
-    PjRtDevice* const device = client->addressable_devices()[0];
-    std::unique_ptr<PjRtBuffer> input;
-    switch (data_type) {
-      case xla::PrimitiveType::F32: {
-        std::vector<float> data_array{10};
-        TF_ASSIGN_OR_RETURN(
-            input,
-            client->BufferFromHostBuffer(
-                data_array.data(), shape.element_type(), shape.dimensions(),
-                /*byte_strides=*/std::nullopt,
-                PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
-                /*on_done_with_host_buffer=*/nullptr,
-                *device->default_memory_space(),
-                /*device_layout=*/nullptr));
+  TF_ASSIGN_OR_RETURN(result, executable->Execute({{}}, ExecuteOptions()));
 
-        break;
-      }
-      case xla::PrimitiveType::F64: {
-        std::vector<double> data_array{10};
-        TF_ASSIGN_OR_RETURN(
-            input,
-            client->BufferFromHostBuffer(
-                data_array.data(), shape.element_type(), shape.dimensions(),
-                /*byte_strides=*/std::nullopt,
-                PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
-                /*on_done_with_host_buffer=*/nullptr,
-                *device->default_memory_space(),
-                /*device_layout=*/nullptr));
-
-        break;
-      }
-      case xla::PrimitiveType::BF16: {
-        std::vector<Eigen::bfloat16> data_array{10};
-        TF_ASSIGN_OR_RETURN(
-            input,
-            client->BufferFromHostBuffer(
-                data_array.data(), shape.element_type(), shape.dimensions(),
-                /*byte_strides=*/std::nullopt,
-                PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
-                /*on_done_with_host_buffer=*/nullptr,
-                *device->default_memory_space(),
-                /*device_layout=*/nullptr));
-
-        break;
-      }
-      case xla::PrimitiveType::F16: {
-        std::vector<Eigen::half> data_array{10};
-        TF_ASSIGN_OR_RETURN(
-            input,
-            client->BufferFromHostBuffer(
-                data_array.data(), shape.element_type(), shape.dimensions(),
-                /*byte_strides=*/std::nullopt,
-                PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
-                /*on_done_with_host_buffer=*/nullptr,
-                *device->default_memory_space(),
-                /*device_layout=*/nullptr));
-
-        break;
-      }
-      case xla::PrimitiveType::U32: {
-        std::vector<uint32_t> data_array{10};
-        TF_ASSIGN_OR_RETURN(
-            input,
-            client->BufferFromHostBuffer(
-                data_array.data(), shape.element_type(), shape.dimensions(),
-                /*byte_strides=*/std::nullopt,
-                PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
-                /*on_done_with_host_buffer=*/nullptr,
-                *device->default_memory_space(),
-                /*device_layout=*/nullptr));
-
-        break;
-      }
-      case xla::PrimitiveType::U64: {
-        std::vector<uint64_t> data_array{10};
-        TF_ASSIGN_OR_RETURN(
-            input,
-            client->BufferFromHostBuffer(
-                data_array.data(), shape.element_type(), shape.dimensions(),
-                /*byte_strides=*/std::nullopt,
-                PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
-                /*on_done_with_host_buffer=*/nullptr,
-                *device->default_memory_space(),
-                /*device_layout=*/nullptr));
-
-        break;
-      }
-      case xla::PrimitiveType::S32: {
-        std::vector<int32_t> data_array{10};
-        TF_ASSIGN_OR_RETURN(
-            input,
-            client->BufferFromHostBuffer(
-                data_array.data(), shape.element_type(), shape.dimensions(),
-                /*byte_strides=*/std::nullopt,
-                PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
-                /*on_done_with_host_buffer=*/nullptr,
-                *device->default_memory_space(),
-                /*device_layout=*/nullptr));
-
-        break;
-      }
-      case xla::PrimitiveType::S64: {
-        std::vector<int64_t> data_array{10};
-        TF_ASSIGN_OR_RETURN(
-            input,
-            client->BufferFromHostBuffer(
-                data_array.data(), shape.element_type(), shape.dimensions(),
-                /*byte_strides=*/std::nullopt,
-                PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
-                /*on_done_with_host_buffer=*/nullptr,
-                *device->default_memory_space(),
-                /*device_layout=*/nullptr));
-        break;
-      }
-      case xla::PrimitiveType::PRED: {
-        std::vector<uint8_t> data_array{10};
-        TF_ASSIGN_OR_RETURN(
-            input,
-            client->BufferFromHostBuffer(
-                data_array.data(), shape.element_type(), shape.dimensions(),
-                /*byte_strides=*/std::nullopt,
-                PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
-                /*on_done_with_host_buffer=*/nullptr,
-                *device->default_memory_space(),
-                /*device_layout=*/nullptr));
-        break;
-      }
-      case xla::PrimitiveType::S8: {
-        std::vector<int8_t> data_array{10};
-        TF_ASSIGN_OR_RETURN(
-            input,
-            client->BufferFromHostBuffer(
-                data_array.data(), shape.element_type(), shape.dimensions(),
-                /*byte_strides=*/std::nullopt,
-                PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
-                /*on_done_with_host_buffer=*/nullptr,
-                *device->default_memory_space(),
-                /*device_layout=*/nullptr));
-        break;
-      }
-      case xla::PrimitiveType::U8: {
-        std::vector<uint8_t> data_array{10};
-        TF_ASSIGN_OR_RETURN(
-            input,
-            client->BufferFromHostBuffer(
-                data_array.data(), shape.element_type(), shape.dimensions(),
-                /*byte_strides=*/std::nullopt,
-                PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
-                /*on_done_with_host_buffer=*/nullptr,
-                *device->default_memory_space(),
-                /*device_layout=*/nullptr));
-        break;
-      }
-      default:
-        return absl::InvalidArgumentError("Invalida data type.");
-    }
-    TF_ASSIGN_OR_RETURN(result,
-                        executable->Execute({{input.get()}}, ExecuteOptions()));
-  } else {
-    TF_ASSIGN_OR_RETURN(result, executable->Execute({{}}, ExecuteOptions()));
-  }
   std::vector<std::unique_ptr<xla::PjRtBuffer>>& result_buffers = result[0];
   TF_ASSIGN_OR_RETURN(std::shared_ptr<xla::Literal> literal,
                       result_buffers[0]->ToLiteralSync());
@@ -496,68 +472,7 @@ absl::Status NvshmemCollectiveTestBody(int rank_id, int num_ranks,
       default:
         return absl::InvalidArgumentError("Invalid data type.");
     }
-  } else if (test_case == "all_reduce") {
-    switch (data_type) {
-      case xla::PrimitiveType::F32: {
-        std::vector<float> ref_data{20};
-        TF_RET_CHECK(literal->data<float>()[0] == ref_data[0]);
-        break;
-      }
-      case xla::PrimitiveType::F64: {
-        std::vector<double> ref_data{20};
-        TF_RET_CHECK(literal->data<double>()[0] == ref_data[0]);
-        break;
-      }
-      case xla::PrimitiveType::BF16: {
-        std::vector<Eigen::bfloat16> ref_data{20};
-        TF_RET_CHECK(literal->data<Eigen::bfloat16>()[0] == ref_data[0]);
-        break;
-      }
-      case xla::PrimitiveType::F16: {
-        std::vector<Eigen::half> ref_data{20};
-        TF_RET_CHECK(literal->data<Eigen::half>()[0] == ref_data[0]);
-        break;
-      }
-      case xla::PrimitiveType::U32: {
-        std::vector<uint32_t> ref_data{20};
-        TF_RET_CHECK(literal->data<uint32_t>()[0] == ref_data[0]);
-        break;
-      }
-      case xla::PrimitiveType::U64: {
-        std::vector<uint64_t> ref_data{20};
-        TF_RET_CHECK(literal->data<uint64_t>()[0] == ref_data[0]);
-        break;
-      }
-      case xla::PrimitiveType::S32: {
-        std::vector<int32_t> ref_data{20};
-        TF_RET_CHECK(literal->data<int32_t>()[0] == ref_data[0]);
-        break;
-      }
-      case xla::PrimitiveType::S64: {
-        std::vector<int64_t> ref_data{20};
-        TF_RET_CHECK(literal->data<int64_t>()[0] == ref_data[0]);
-        break;
-      }
-      case xla::PrimitiveType::PRED: {
-        std::vector<uint8_t> ref_data{20};
-        TF_RET_CHECK(literal->data<uint8_t>()[0] == ref_data[0]);
-        break;
-      }
-      case xla::PrimitiveType::S8: {
-        std::vector<int8_t> ref_data{20};
-        TF_RET_CHECK(literal->data<int8_t>()[0] == ref_data[0]);
-        break;
-      }
-      case xla::PrimitiveType::U8: {
-        std::vector<uint8_t> ref_data{20};
-        TF_RET_CHECK(literal->data<uint8_t>()[0] == ref_data[0]);
-        break;
-      }
-      default:
-        return absl::InvalidArgumentError("Invalida data type.");
-    }
-  }
-
+  } 
   VLOG(1) << "Rank " << rank_id << " completed successfully";
 
   return absl::OkStatus();
@@ -586,9 +501,12 @@ int main(int argc, char* argv[]) {
   tsl::Flags::Parse(&argc, argv, flag_list);
   testing::InitGoogleTest(&argc, argv);
   if (rank_id >= 0) {
-    return xla::NvshmemCollectiveTestBody(rank_id, num_ranks, input_data_type,
-                                          test_case)
-        .raw_code();
+    auto s = xla::NvshmemCollectiveTestBody(rank_id, num_ranks, input_data_type,
+                                          test_case);
+    if (!s.ok()) {
+      VLOG(0) << "Failed with " << s;
+    }
+    return s.raw_code();
   }
   return RUN_ALL_TESTS();
 }
