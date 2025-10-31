@@ -721,6 +721,7 @@ void AddLoweringPasses(mlir::OpPassManager& pm,
     if (cc->has_fp8_support()) {
       pm.addPass(CreateConvertFloatAMDPass(*cc));
     }
+    pm.addNestedPass<FuncOp>(emitters::CreateSimplifyMathPass());
     pm.addPass(CreateRecoverExp2Pass());
   }
 
