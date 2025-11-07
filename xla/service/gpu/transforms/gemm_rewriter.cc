@@ -66,6 +66,7 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/gpu/gpu_blas_lt.h"
 #include "xla/stream_executor/semantic_version.h"
+#include "xla/tsl/util/env_var.h"
 #include "xla/tsl/protobuf/dnn.pb.h"
 #include "xla/types.h"
 #include "xla/util.h"
@@ -73,6 +74,8 @@ limitations under the License.
 #include "tsl/platform/errors.h"
 #include "tsl/platform/ml_dtypes.h"
 #include "tsl/platform/statusor.h"
+
+#define DO_NOT_FUSE_ANY 1
 
 namespace xla {
 namespace gpu {
@@ -581,6 +584,59 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
         toolkit_version_(toolkit_version),
         options_(options) {}
 
+    bool IsFP8only() {
+      return options_.dtype == GemmRewriterOptions::DType::kFp8Only;
+    }
+
+    bool enable_fuse_maxtrix_bias_add() {
+      if (!IsFP8only()) return true;
+      bool enabled = true;
+      TF_CHECK_OK(tsl::ReadBoolFromEnvVar("XLA_GEMM_REWRITER_FP8_FUSE_MATRIX_BIAS",
+                                  /*default_val=*/true, &enabled));
+      return enabled;
+    }
+
+
+    bool fuse_multiply() {
+      if (!IsFP8only()) return true;
+      bool enabled = true;
+      TF_CHECK_OK(tsl::ReadBoolFromEnvVar("XLA_GEMM_REWRITER_FUSE_MULTIPLY",
+                                  /*default_val=*/true, &enabled));
+      return enabled;
+    }
+
+    bool fuse_divide() {
+      if (!IsFP8only()) return true;
+      bool enabled = true;
+      TF_CHECK_OK(tsl::ReadBoolFromEnvVar("XLA_GEMM_REWRITER_FUSE_DIVIDE",
+                                  /*default_val=*/true, &enabled));
+      return enabled;
+    }
+
+    bool fuse_add() {
+      if (!IsFP8only()) return true;
+      bool enabled = true;
+      TF_CHECK_OK(tsl::ReadBoolFromEnvVar("XLA_GEMM_REWRITER_FUSE_ADD",
+                                  /*default_val=*/true, &enabled));
+      return enabled;
+    }
+
+    bool fuse_max() {
+      if (!IsFP8only()) return true;
+      bool enabled = true;
+      TF_CHECK_OK(tsl::ReadBoolFromEnvVar("XLA_GEMM_REWRITER_FUSE_MAX",
+                                  /*default_val=*/true, &enabled));
+      return enabled;
+    }
+
+    bool fuse_convert() {
+      if (options_.dtype != GemmRewriterOptions::DType::kFp8Only) return true;
+      bool enabled = true;
+      TF_CHECK_OK(tsl::ReadBoolFromEnvVar("XLA_GEMM_REWRITER_FUSE_CONVERT",
+                                  /*default_val=*/true, &enabled));
+      return enabled;
+    }
+
   absl::Status HandleDot(HloInstruction *instr) override {
     if (!IsMatrixMultiplication(*instr) &&
         !IsMatrixVectorMultiplication(*instr)) {
@@ -727,6 +783,8 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
   }
 
   absl::Status HandleMultiply(HloInstruction *instr) override {
+
+    if (!fuse_multiply()) return absl::OkStatus();
     HloInstruction *alpha, *existing_gemm;
     if (Match(instr,
               m::MultiplyAnyOrder(
@@ -748,6 +806,10 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
         config.set_alpha_real(new_alpha.real());
         config.set_alpha_imag(new_alpha.imag());
         TF_RETURN_IF_ERROR(existing_gemm->set_backend_config(gpu_config));
+
+        if (IsFP8only()) {
+          VLOG(0) << "Fp8 fused alpha " << existing_gemm->ToString();
+        }
         return ReplaceInstruction(instr, existing_gemm);
       }
     }
@@ -756,7 +818,11 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
     if (Match(instr, m::MultiplyAnyOrder(
                          CublasLtMatmulF8(&existing_gemm).WithOneUser(),
                          m::Broadcast(m::Op(&d_scale)).WithOneUser()))) {
-      return F8ScaleD(instr, existing_gemm, d_scale);
+      auto s = F8ScaleD(instr, existing_gemm, d_scale);
+      if (IsFP8only()) {
+        VLOG(0) << "Trying Fp8scaleD " << existing_gemm->ToString();
+      }
+      return s;
     }
 
     {
@@ -805,6 +871,9 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
                                   .WithOneUser())
                               .WithOneUser())
                           .WithOneUser())))) {
+      if (IsFP8only()) {
+        VLOG(0) << "Fused GELU " << existing_gemm->ToString();
+      }
         return FuseGeluActivation(instr, existing_gemm, slice_or_bitcast);
       }
     }
@@ -832,6 +901,10 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
                                                               ? slice_or_bitcast
                                                               : existing_gemm)))
                                   .WithOneUser())))) {
+      if (IsFP8only()) {
+        VLOG(0) << "Fp8 Fused SWISH " << existing_gemm->ToString();
+        // return absl::OkStatus();
+      }
         return FuseSwishActivation(instr, existing_gemm, slice_or_bitcast);
       }
     }
@@ -840,15 +913,23 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
 
   // Fuse the scaling of an FP8 GEMM into the Custom Call.
   absl::Status HandleDivide(HloInstruction *instr) override {
+    
+    if (!fuse_divide()) return absl::OkStatus();
     HloInstruction *existing_gemm, *d_scale;
     if (Match(instr, m::Divide(CublasLtMatmulF8(&existing_gemm).WithOneUser(),
                                m::Broadcast(m::Op(&d_scale)).WithOneUser()))) {
-      return F8ScaleD(instr, existing_gemm, d_scale);
+      auto s = F8ScaleD(instr, existing_gemm, d_scale);
+      if (IsFP8only()) {
+        VLOG(0) << "Fp8 Fused Divide " << existing_gemm->ToString();
+      }
+      return s;
     }
     return absl::OkStatus();
   }
 
   absl::Status HandleAdd(HloInstruction *instr) override {
+
+    if (!fuse_add()) return absl::OkStatus();
     if (options_.bias_mode == GemmRewriterOptions::BiasMode::kNoBias) {
       // See comments for `GemmRewriterOptions::BiasMode` for details.
       return absl::OkStatus();
@@ -877,6 +958,9 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
                             optional_convert, optional_bitcast));
 
       if (was_fused) {
+        if (IsFP8only()) {
+          VLOG(0) << "Fp8 Fused biasAdd " << existing_gemm->ToString();
+        }
         return absl::OkStatus();
       }
     }
@@ -899,6 +983,9 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
       TF_RETURN_IF_ERROR(
           ReplaceInstruction(instr, MakeBitcastHlo(new_add, instr->shape())));
 
+       if (IsFP8only()) {
+        VLOG(0) << "Fp8 elide broadcast ";
+      }
       // Continue below.
       instr = new_add;
     }
@@ -933,6 +1020,9 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
           ReplaceInstruction(instr, MakeBitcastHlo(new_add, instr->shape())));
 
       // Continue below transforming new_add.
+      if (IsFP8only()) {
+        VLOG(0) << "Fp8 elide2  " << new_add->ToString();
+      }
       instr = new_add;
     }
 
@@ -972,6 +1062,11 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
            instr->users()[0]->user_count() == 0);
 
       if (types_are_supported && has_no_consumer) {
+
+    if (IsFP8only()) {
+        VLOG(0) << "Fp8 trying fuse matrix bias  " << existing_gemm->ToString();
+      }
+
         return FuseMatrixBiasAdd(instr, bias, existing_gemm);
       }
     }
@@ -990,9 +1085,20 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
       // The matrix bias must not be FP8, see
       // https://docs.nvidia.com/cuda/cublas/index.html.
       if (!IsF8Type(bias)) {
-        return FuseMatrixBiasAdd(instr, bias, existing_gemm,
+
+      if (!enable_fuse_maxtrix_bias_add()) {
+        VLOG(0) << "NOT Fp8 fuse matrix bias2  " << existing_gemm->ToString()
+                << " bias " << bias->ToString();
+        return absl::OkStatus();
+      } 
+
+        auto s = FuseMatrixBiasAdd(instr, bias, existing_gemm,
                                  optional_bitcast_matrix,
                                  optional_slice_matrix);
+       if (IsFP8only()) {
+        VLOG(0) << "DO Fp8 fuse matrix bias2 new gemm " << instr->ToString();
+      }
+        return s;
       }
     }
 
@@ -1000,6 +1106,8 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
   }
 
   absl::Status HandleMaximum(HloInstruction *instr) override {
+
+    if (!fuse_max()) return absl::OkStatus();
     HloInstruction *existing_gemm, *zeros;
     HloInstruction *optional_slice_or_bitcast = nullptr;
     // Attempt to elide maximum and fuse ReLU activation into GEMM, including
@@ -1016,6 +1124,10 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
                       CublasLtMatmulMaybeF8(&existing_gemm))
                       .WithOneUser(),
                   m::Broadcast(&zeros, m::ConstantScalar(0))))) {
+
+      if (IsFP8only()) {
+        VLOG(0) << "Fp8 fuse relu  " << existing_gemm->ToString();
+      }
       TF_RETURN_IF_ERROR(FuseReluActivation(instr, zeros, existing_gemm,
                                             optional_slice_or_bitcast));
     }
@@ -1023,6 +1135,8 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
   }
 
   absl::Status HandleConvert(HloInstruction *instr) override {
+
+    if (!fuse_convert()) return absl::OkStatus();
     HloInstruction *clamp_lower, *clamp_upper, *existing_gemm,
         *d_scale = nullptr, *binary = nullptr;
     // Attempt to elide the scaling and conversion of the result of an FP8
@@ -1041,10 +1155,15 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
                                               m::Broadcast(m::Op(&d_scale)))),
                       m::Broadcast(m::ConstantScalar(&clamp_upper)))
                       .WithOneUser()))) {
-      return F8ConvertD(
+      auto s= F8ConvertD(
           instr, existing_gemm, d_scale, clamp_lower, clamp_upper,
           /*mult_scale=*/
           (binary && HloPredicateIsOp<HloOpcode::kMultiply>(binary)));
+      if (IsFP8only()) {
+        VLOG(0) << "Fp8 fuse convert  " << existing_gemm->ToString();
+      }
+
+      return s;
     }
     return absl::OkStatus();
   }
@@ -1426,7 +1545,7 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
 
     TF_RETURN_IF_ERROR(
         ReplaceInstruction(instr, slice ? slice : new_custom_call));
-    VLOG(1) << instr->ToString() << " rewritten into FP8 Custom Call.";
+    // VLOG(1) << instr->ToString() << " rewritten into FP8 Custom Call.";
     return true;
   }
 
@@ -1468,7 +1587,7 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
     TF_RETURN_IF_ERROR(existing_gemm->ReplaceOperandWith(2, d_scale));
     TF_RETURN_IF_ERROR(ReplaceInstruction(instr, existing_gemm));
 
-    VLOG(1) << "Scaling of FP8 GEMM fused into Custom Call.";
+    // VLOG(1) << "Scaling of FP8 GEMM fused into Custom Call.";
     return absl::OkStatus();
   }
 
@@ -1693,6 +1812,7 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
     }();
     bool want_to_fuse_bias = IsCublasLtMatmulF8(*gemm) ||
                              IsCublasLtMatmul(*gemm) || can_overwrite_bias;
+    VLOG(0) << "can_overwrite_bias " << can_overwrite_bias;
 
     auto gpu_config = gemm->backend_config<GpuBackendConfig>().value();
     GemmBackendConfig &config = *gpu_config.mutable_gemm_backend_config();
@@ -1745,9 +1865,13 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
     // true if those uses all come before this operation.  But copy-insertion
     // runs before scheduling, so it can't know and has to conservatively insert
     // copies.)
+
+    if(!IsFP8only())
+    { // only alias if not fp8!
     if (IsLegacyCublasMatmul(*fused_op) || can_overwrite_bias) {
       xla::Cast<HloCustomCallInstruction>(fused_op.get())
           ->set_output_to_operand_aliasing({{{}, {2, {}}}});
+    }
     }
     TF_RETURN_IF_ERROR(SetName(instr->GetModule(), fused_op.get()));
     if (slice) {

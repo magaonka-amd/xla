@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <fstream>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -73,6 +74,12 @@ limitations under the License.
 
 namespace stream_executor {
 
+namespace gpu {
+
+extern bool launch_Xadd_kernel(void *out, const void *in, const void *gemm_out, 
+        uint64_t bytes, uint32_t *flag, hipStream_t stream);
+
+}
 namespace rocm {
 
 using ::xla::complex128;
@@ -258,6 +265,8 @@ auto BlasLt::MatmulPlan::GetAlgorithms(const Stream* stream,
              layout.type() == HIP_R_8F_E5M2 || layout.type() == HIP_R_8F_E4M3;
     };
     if (IsFP8(a_desc_) && IsFP8(b_desc_)) {
+
+      VLOG(0) << "Setting ascale/bscale dummies!";
       static int64_t dummy_pointer = 0xACEBALL;
       TF_RETURN_IF_ERROR(SetAttr(op_desc_.get(),
                                  HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER,
@@ -352,6 +361,14 @@ auto BlasLt::GetMatmulPlan(const gpu::GemmConfig& cfg, Epilogue epilogue) const
   TF_ASSIGN_OR_RETURN(auto c_desc, MatrixLayout::Create(c_layout));
   TF_ASSIGN_OR_RETURN(auto d_desc, MatrixLayout::Create(output_layout));
 
+  uint64_t m_ = output_layout.num_rows,
+       n_ = output_layout.num_cols;
+
+  if(!(m_ == c_layout.num_rows && n_ == c_layout.num_cols)) {
+    LOG(FATAL) << "oops different layouts " << m_ << 'x' << n_ <<
+        " vs "<< c_layout.num_rows << 'x' << c_layout.num_cols;
+  }
+
 #if TF_ROCM_VERSION >= 60000
   // Currently, the default bias data type in hipblasLt is the same with output
   // data type for fp8 matmul, which is different from cublasLt. This is a
@@ -376,11 +393,20 @@ auto BlasLt::GetMatmulPlan(const gpu::GemmConfig& cfg, Epilogue epilogue) const
   }
 #endif  // TF_ROCM_VERSION >= 60000
 
-  return std::make_unique<MatmulPlan>(std::move(op_desc), std::move(a_desc),
+  auto ss = std::make_unique<MatmulPlan>(std::move(op_desc), std::move(a_desc),
                                       std::move(b_desc), std::move(c_desc),
                                       std::move(d_desc), cfg.alpha, cfg.beta,
                                       must_swap_operands);
+
+  ss->m_ = m_, ss->n_ = n_;
+  return std::move(ss);
 }
+
+  typedef struct __attribute__((packed, aligned(8))) _rocblaslt_matmul_algo {
+    uint8_t data[8] = {0};
+    bool fallback = false;
+    size_t max_workspace_bytes = 0;
+  } rocblaslt_matmul_algo;
 
 absl::Status BlasLt::MatmulPlan::DoMatmul(
     Stream* stream, const void* alpha, const void* beta,
@@ -427,6 +453,7 @@ absl::Status BlasLt::MatmulPlan::DoMatmul(
     // We must set the bias and aux pointers while holding the mutex, to avoid a
     // potential race condition from multiple threads sharing the same plan.
     if (op_desc_.has_bias_epilogue() && args.bias != nullptr) {
+      VLOG(0) << "Setting bias ptr";
       TF_RETURN_IF_ERROR(SetAttr(op_desc_.get(),
                                  HIPBLASLT_MATMUL_DESC_BIAS_POINTER,
                                  args.bias.opaque()));
@@ -434,11 +461,13 @@ absl::Status BlasLt::MatmulPlan::DoMatmul(
 
 #if TF_ROCM_VERSION >= 60000
     if (args.a_scale != nullptr) {
+      // VLOG(0) << "Setting a_scale ptr";
       TF_RETURN_IF_ERROR(SetAttr(op_desc_.get(),
                                  HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER,
                                  args.a_scale.opaque()));
     }
     if (args.b_scale != nullptr) {
+      // VLOG(0) << "Setting b_scale ptr";
       TF_RETURN_IF_ERROR(SetAttr(op_desc_.get(),
                                  HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER,
                                  args.b_scale.opaque()));
@@ -484,12 +513,6 @@ absl::Status BlasLt::MatmulPlan::DoMatmul(
     }
   }
 
-  typedef struct __attribute__((packed, aligned(8))) _rocblaslt_matmul_algo {
-    uint8_t data[8] = {0};
-    bool fallback = false;
-    size_t max_workspace_bytes = 0;
-  } rocblaslt_matmul_algo;
-
   if (profile_result != nullptr) {
     TF_ASSIGN_OR_RETURN(absl::Duration elapsed, timer->GetElapsedDuration());
     // set algorithm ID to be unique (otherwise it gets kDefaultAlgorithm ID)
@@ -502,11 +525,17 @@ absl::Status BlasLt::MatmulPlan::DoMatmul(
   return absl::OkStatus();
 }
 
+BlasLt::MatmulPlan::~MatmulPlan() {
+  if (exec_ && !XD_.is_null()) {
+    exec_->Deallocate(&XD_);
+  }
+}
+
 absl::Status BlasLt::MatmulPlan::ExecuteOnStream(
     Stream* stream, const MatmulAlgorithm& algorithm,
     const gpu::BlasLt::MemoryArgs& args,
     blas::ProfileResult* profile_result) const {
-  auto wrapped_matmul = [&](auto scale) {
+  auto wrapped_matmul = [&](auto scale, auto at, auto bt, auto dt) -> absl::Status{
     using Scale = decltype(scale);
     Scale salpha;
     if constexpr (std::is_same_v<Scale, xla::complex64> ||
@@ -516,7 +545,74 @@ absl::Status BlasLt::MatmulPlan::ExecuteOnStream(
       salpha = static_cast<Scale>(alpha_.real());
     }
     Scale sbeta = static_cast<Scale>(beta_);
-    return DoMatmul(stream, &salpha, &sbeta, algorithm, args, profile_result);
+
+    bool okok = (false && at == HIP_R_8F_E4M3 && bt == HIP_R_8F_E5M2 &&
+      dt == HIP_R_16BF && sbeta != Scale{0});
+    uint64_t sz = m_ * n_ * sizeof(uint16_t);
+    if (okok) {
+     
+      // VLOG(0) << "Caught fp8 mixed mul c=" 
+      // << args.c.opaque() << " sz " << sz
+      // << " d=" << args.d.opaque() << " sz " << args.d.size()
+      //  << " a_scale=" << args.a_scale.opaque()
+      //  << " b_scale=" << args.b_scale.opaque()
+      //  << " c_scale=" << args.c_scale.opaque() 
+      //  << " d_scale=" << args.d_scale.opaque()
+      //  << " d_amax=" << args.d_amax.opaque();
+
+       if (args.c.opaque() == args.d.opaque()) {
+        LOG(FATAL) << "ops arguments are aliased!";
+       }
+
+       if (XD_.is_null()) {
+        exec_ = stream->parent();
+        XD_ = exec_->Allocate(sz * 2);
+        TF_ASSIGN_OR_RETURN(Xsignal_, exec_->HostMemoryAllocate(8));
+        auto ptr = (uint32_t *)Xsignal_->opaque();
+        *ptr = 0;
+       }
+       
+      sbeta = 0;
+      TF_RETURN_IF_ERROR(stream->MemZero(const_cast< DeviceMemoryBase *>(&args.a), args.a.size()));
+      
+      // TF_RETURN_IF_ERROR(stream->Memset32(const_cast< DeviceMemoryBase *>(&args.b), 
+      //       0x30303030,
+      //       args.b.size()));
+      TF_RETURN_IF_ERROR(stream->MemZero(const_cast< DeviceMemoryBase *>(&args.c), sz));
+
+      TF_RETURN_IF_ERROR(DoMatmul(stream, &salpha, &sbeta, algorithm, args, profile_result));
+      TF_RETURN_IF_ERROR(stream->Memcpy(&XD_, args.d, sz));
+      
+      
+      sbeta = 1; // now rerun with non-zero beta
+    }
+
+    auto s = DoMatmul(stream, &salpha, &sbeta, algorithm, args, profile_result);
+    if (okok) {
+      bool ok = gpu::launch_Xadd_kernel(XD_.opaque(), args.c.opaque(), args.d.opaque(), sz,
+        (uint32_t *)Xsignal_->opaque(), absl::bit_cast<hipStream_t>(
+              stream->platform_specific_handle().stream));
+      if (ok) return s;
+      auto palgo = std::any_cast<hipblasLtMatmulAlgo_t>(&algorithm.opaque_algo);
+      auto roc_algo = (const rocblaslt_matmul_algo*)palgo;
+      auto pindex = (int*)roc_algo->data;
+      VLOG(0) << "fp8 matmul with algo " << *pindex << " failed!";
+
+      std::vector< hipblaslt_bf8 > bs(args.b.size());
+      std::vector< float > ascale(args.a_scale.size()/4), bscale(args.b_scale.size()/4);
+      TF_RETURN_IF_ERROR(stream->Memcpy(bs.data(), args.b, bs.size()));
+      TF_RETURN_IF_ERROR(stream->Memcpy(ascale.data(), args.a_scale, args.a_scale.size()));
+      TF_RETURN_IF_ERROR(stream->Memcpy(bscale.data(), args.b_scale, args.b_scale.size()));
+      TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
+
+      for(int i = 0; i < ascale.size(); i++) VLOG(0) << " ascale "<< ascale[i];
+      for(int i = 0; i < bscale.size(); i++) VLOG(0) << " bscale "<< ascale[i];
+      
+      std::ofstream ofs("/tf/xla/matrixb.bin");
+      ofs.write((char*)bs.data(), bs.size()); 
+      exit(1);
+    }
+    return s;
   };
 
   std::tuple operand_types{a_desc_.type(), b_desc_.type(), c_desc_.type(),
@@ -524,7 +620,7 @@ absl::Status BlasLt::MatmulPlan::ExecuteOnStream(
 
 #define TYPED_MATMUL(Scale, ATYPE, BTYPE, CTYPE, DTYPE)          \
   if (operand_types == std::tuple{ATYPE, BTYPE, CTYPE, DTYPE}) { \
-    return wrapped_matmul(Scale{});                              \
+    return wrapped_matmul(Scale{}, ATYPE, BTYPE, DTYPE);                              \
   }
 
 // FP8 compatible types combinations (Full table in

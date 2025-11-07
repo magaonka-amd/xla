@@ -245,7 +245,7 @@ absl::Status RunPassPipeline(mlir::ModuleOp module, const HloModule& hlo_module,
   tsl::StatusScopedDiagnosticHandler diagnostic_handler(module.getContext());
   (void)pm.run(module);
 
-  if (should_dump_mlir_passes) {
+  if(0) { //if (should_dump_mlir_passes) {
     DumpPerModuleProtobufToFile(
         hlo_module, trace, hlo_module.config().debug_options(),
         absl::StrCat(entry_function_name, ".mlir-trace"));

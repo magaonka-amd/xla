@@ -783,6 +783,8 @@ absl::Status IrEmitterUnnested::EmitCublasLtMatmulThunkF8(
       ir_emitter_context_->gpu_compute_capability());
   bool is_fp8 = instr->shape().tuple_shapes(0).element_type() == F8E4M3FN ||
                 instr->shape().tuple_shapes(0).element_type() == F8E5M2;
+
+  if (is_fp8) LOG(FATAL) << "Found fp8 gemm!!";
   // cublasLT requires c_scale/d_scale to be null when C/D is not FP8.
   // Currently, C cannot be FP8.
   BufferAllocation::Slice c_scale, d_scale;

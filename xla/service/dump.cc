@@ -459,8 +459,13 @@ static std::vector<std::string> DumpHloModuleImpl(
   std::vector<std::optional<std::string>> file_paths;
 
   if (opts.dump_as_text) {
+
+    HloPrintOptions popts;
+    popts.set_print_metadata(false);
+    popts.set_print_percent(false);
+    popts.set_include_layout_in_shapes(false);
     file_paths.push_back(DumpToFileInDirOrStdoutImpl(StrCat(filename, ".txt"),
-                                                     module.ToString(), opts));
+                                                     module.ToString(popts), opts));
     if (buffer_assn) {
       DataProducer buffer_assignment;
       buffer_assignment.Append([&] { return buffer_assn->ToString(); });

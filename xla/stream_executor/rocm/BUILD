@@ -793,6 +793,7 @@ rocm_library(
     ],
     deps = [
         "@local_config_rocm//rocm:rocm_headers",
+        "@eigen_archive//:eigen3",
     ],
     alwayslink = True,
 )

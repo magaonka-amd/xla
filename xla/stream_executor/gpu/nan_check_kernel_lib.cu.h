@@ -31,7 +31,7 @@ limitations under the License.
 namespace stream_executor::gpu {
 
 template <typename T>
-__global__ void xla_nan_check(T* buffer, uint64_t buffer_length,
+__global__ void xla_nan_check(T * buffer, uint64_t buffer_length,
                               const char* msg, uint32_t* abort_lock) {
   const uint64_t block_dim_x = static_cast<uint64_t>(blockDim.x),
                  stride = block_dim_x * gridDim.x;
@@ -45,7 +45,9 @@ __global__ void xla_nan_check(T* buffer, uint64_t buffer_length,
   // TODO(rocm): vectorize
   for (uint64_t idx = threadIdx.x + blockIdx.x * block_dim_x;
        idx < buffer_length; idx += stride) {
-    found_nan |= Eigen::numext::isnan(buffer[idx]);
+    auto val = buffer[idx];
+    found_nan |= Eigen::numext::isnan(val);
+    found_nan |= Eigen::numext::isinf(val);
   }
 
   if (TF_PREDICT_TRUE(__all(!found_nan))) {

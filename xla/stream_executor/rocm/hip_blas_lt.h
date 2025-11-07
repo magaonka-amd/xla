@@ -23,6 +23,7 @@ limitations under the License.
 #include "xla/stream_executor/gpu/gpu_blas_lt.h"
 #include "xla/stream_executor/host_or_device_scalar.h"
 #include "xla/stream_executor/stream.h"
+#include "xla/stream_executor/memory_allocation.h"
 #include "xla/types.h"
 
 #if TF_HIPBLASLT
@@ -99,7 +100,7 @@ class BlasLt : public gpu::BlasLt {
           beta_(beta),
           must_swap_operands_(must_swap_operands) {}
 
-    ~MatmulPlan() override = default;
+    ~MatmulPlan() override;
 
     absl::Status ExecuteOnStream(
         Stream* stream, const MatmulAlgorithm& algorithm,
@@ -109,6 +110,8 @@ class BlasLt : public gpu::BlasLt {
     absl::StatusOr<std::vector<MatmulAlgorithm>> GetAlgorithms(
         const Stream* stream, size_t max_algorithm_count,
         size_t max_workspace_size) const override;
+
+    uint64_t m_, n_;
 
    protected:
     absl::Status DoMatmul(Stream* stream, const void* alpha, const void* beta,
@@ -126,6 +129,10 @@ class BlasLt : public gpu::BlasLt {
     xla::complex128 alpha_;
     double beta_;
     bool must_swap_operands_;
+
+    mutable StreamExecutor *exec_ = nullptr;
+    mutable DeviceMemoryBase XD_;
+    mutable std::unique_ptr<MemoryAllocation> Xsignal_;
   };  // class MatmulPlan
 
   explicit BlasLt(StreamExecutor* parent)

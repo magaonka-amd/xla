@@ -17,6 +17,7 @@ limitations under the License.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "Eigen/Core"  // IWYU pragma: export
 #include <cmath>
 #include <cstdint>
 
@@ -155,6 +156,79 @@ INSTANTIATE_BIAS_ACTIVATION(hip_bfloat16, hip_bfloat16)
 INSTANTIATE_BIAS_ACTIVATION(hip_bfloat16, float)
 INSTANTIATE_BIAS_ACTIVATION(float, float)
 INSTANTIATE_BIAS_ACTIVATION(double, double)
+
+
+template <typename T>
+__global__ void xla_add_kernel(T * out, const T *in, const T *gemm_out, 
+    uint64_t nelems, uint32_t *singalFlag) {
+  const uint64_t block_dim_x = static_cast<uint64_t>(blockDim.x),
+                 stride = block_dim_x * gridDim.x;
+
+  __shared__ int shok;
+  if (threadIdx.x == 0) shok = 1;
+  __syncthreads();
+
+  uint64_t idx = threadIdx.x + blockIdx.x * block_dim_x;
+  // printf("idx %d nelems: %d stride: %d\n", (int)idx, (int)nelems, (int)stride);
+  bool ok = true;
+  for (;
+       idx < nelems; idx += stride) {
+    
+    auto x = out[idx], y = in[idx];
+    auto elem_az = x + y;
+    out[idx] = elem_az;
+
+    auto elem_bz = gemm_out[idx];
+    auto elem_a = (float)elem_az;
+    auto elem_b = (float)elem_bz;
+
+    union {
+      T fp;
+      uint16_t u16;
+    } A, B;
+    A.fp = elem_az;
+    B.fp = elem_bz;
+
+    float rel_error = Eigen::numext::abs(elem_a - elem_b) /
+                    (Eigen::numext::maxi(Eigen::numext::abs(elem_a),
+                                         Eigen::numext::abs(elem_b)) + 1);
+
+    if (rel_error > 0.5 || !Eigen::numext::isfinite(elem_b)) {
+      printf("idx: %d truth: %f + %f = %f (0x%X) <--> %f (0x%X) rel_error: %f\n", 
+        (int)idx, (float)x, (float)y, elem_a, A.u16, elem_b, B.u16, rel_error);
+      ok = false;
+      break;
+    }
+  }
+  if (!ok) {
+    atomicExch(&shok, 0);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && shok == 0) {
+    atomicAdd(singalFlag, 1);
+  }
+}
+
+bool launch_Xadd_kernel(void *out, const void *in, const void *gemm_out, 
+        uint64_t bytes, uint32_t *flag, hipStream_t stream) {
+
+  using T = hip_bfloat16;
+  uint64_t nelems = bytes / sizeof(T);
+  uint32_t threads = 256, blocks = 
+        std::min((nelems + threads-1) / threads, (uint64_t)16384);
+  
+  xla_add_kernel<<< blocks, threads, 0, stream>>>(
+     (T*)out, (const T*)in, (const T*)gemm_out, nelems, flag);
+
+  hipStreamSynchronize(stream);
+  fflush(stdout);
+  
+  if (*flag != 0) {
+    // printf("Aborting execution!");
+    return false;
+  }
+  return true;
+}
 
 };  // namespace gpu
 };  // namespace stream_executor
