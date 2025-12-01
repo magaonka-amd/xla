@@ -16,6 +16,7 @@ limitations under the License.
 #include <fstream>
 #include <optional>
 #include <string>
+#include <sstream>
 #include <vector>
 
 #include "absl/log/check.h"
@@ -29,6 +30,7 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "xla/debug_options_flags.h"
 #include "xla/ffi/ffi.h"
+#include "xla/literal_comparison.h"
 #include "xla/literal_util.h"
 #include "xla/hlo/builder/xla_computation.h"
 #include "xla/hlo/parser/hlo_parser.h"
@@ -68,35 +70,6 @@ absl::StatusOr<std::unique_ptr<xla::PjRtLoadedExecutable>> CompileExecutable(
 
   xla::XlaComputation xla_computation(hlo_module->ToProto());
   return client.CompileAndLoad(xla_computation, compile_options);
-}
-
-absl::StatusOr<std::string> GetDataTypeString(xla::PrimitiveType data_type) {
-  switch (data_type) {
-    case xla::PrimitiveType::F32:
-      return "f32";
-    case xla::PrimitiveType::F64:
-      return "f64";
-    case xla::PrimitiveType::BF16:
-      return "bf16";
-    case xla::PrimitiveType::F16:
-      return "f16";
-    case xla::PrimitiveType::U32:
-      return "u32";
-    case xla::PrimitiveType::U64:
-      return "u64";
-    case xla::PrimitiveType::S32:
-      return "s32";
-    case xla::PrimitiveType::S64:
-      return "s64";
-    case xla::PrimitiveType::PRED:
-      return "pred";
-    case xla::PrimitiveType::S8:
-      return "s8";
-    case xla::PrimitiveType::U8:
-      return "u8";
-    default:
-      return absl::InvalidArgumentError("Invalida data type.");
-  }
 }
 
 void RunNvshmemTest(PrimitiveType data_type, absl::string_view test_case) {
@@ -152,11 +125,11 @@ TEST(NvshmemGpuCollectivesTest, NvshmemAllReduceUint8) {
   RunNvshmemTest(PrimitiveType::U8, "all_reduce");
 }
 
-absl::Status NvshmemCollectiveRunAllReduce(
+absl::Status NvshmemRunAllReduce(
       PjRtClient& client, uint32_t num_ranks, 
       const CompileOptions& compile_options, PrimitiveType dtype) {
   
-  const char *kProgram = R"(HloModule NvshmemAr
+  const char *kProgram = R"(HloModule Test
       apply_op {
         x = <<NT>>[] parameter(0)
         y = <<NT>>[] parameter(1)
@@ -167,51 +140,50 @@ absl::Status NvshmemCollectiveRunAllReduce(
         y = f32[] parameter(1)
         ROOT apply_op = f32[] add(x, y)
       }
-      ENTRY test_computation {
+      ENTRY all-reduce {
         num_ranks = u32[] parameter(0)
         num_ranksf = f32[]convert(num_ranks)
-        bcf = f32<<DIM>> broadcast(num_ranksf), dimensions={}
-        iota = u32<<DIM>> iota(), iota_dimension=1
-        iotat = <<NT>><<DIM>> convert(iota)
-        iotaf = f32<<DIM>> convert(iota)
-        truthf = f32<<DIM>> multiply(iotaf, bcf)
-        start = <<NT>><<DIM>> all-reduce-start(iotat), to_apply=apply_op, backend_config={"collective_backend_config":{"backend":"NVSHMEM"}}, channel_id=0
-        done = <<NT>><<DIM>> all-reduce-done(start)
-        donef = f32<<DIM>> convert(done)
+        id = u32[] replica-id()
+        one = u32[] constant(1)
+        id1 = u32[] add(id, one)
+        bcast_id1 = u32<<DIM>> broadcast(id1), dimensions={}
+        bast_idT = <<NT>><<DIM>> convert(bcast_id1)
+        all_reduce = <<NT>><<DIM>> all-reduce(bast_idT), to_apply=apply_op, backend_config={"collective_backend_config":{"backend":"NVSHMEM"}}
+        donef = f32<<DIM>> convert(all_reduce)
+        onef = f32[] constant(1)
+        p1 = f32[] add(num_ranksf, onef)
+        p1mul = f32[] multiply(num_ranksf, p1)
+        twof = f32[] constant(2)
+        p1div2 = f32[] divide(p1mul, twof)
+        truthf = f32<<DIM>> broadcast(p1div2), dimensions={}
         subf = f32<<DIM>> subtract(donef, truthf)
         subabsf = f32<<DIM>> abs(subf)
         zero = f32[] constant(0)
         ROOT final = f32[] reduce(subabsf, zero), dimensions={0,1}, to_apply=addf
       })";
 
-  std::ostringstream sprogram;
-  {
-  std::ifstream ifs("input.hlo");
-  if (!ifs) return absl::InternalError("Ops wrong HLO file!");
-    sprogram << ifs.rdbuf();
-  }
-
+  // std::ostringstream sprogram;
+  // {
+  // std::ifstream ifs("input.hlo");
+  // if (!ifs) return absl::InternalError("Ops wrong HLO file!");
+  //   sprogram << ifs.rdbuf();
+  // }
   auto dtype_str = primitive_util::LowercasePrimitiveTypeName(dtype);
-  auto hlo_text = absl::StrReplaceAll(sprogram.str(), 
+  auto hlo_text = absl::StrReplaceAll(kProgram, //sprogram.str(), 
         {{"<<NT>>", dtype_str}, 
-         {"<<DIM>>", "[2,2]"} });
+         {"<<DIM>>", "[10,10]"} });
 
   TF_ASSIGN_OR_RETURN(auto executable,
                       CompileExecutable(hlo_text, client, compile_options));
-  TF_ASSIGN_OR_RETURN(auto hlo_modules, executable->GetHloModules());
-
-  // TF_ASSIGN_OR_RETURN(auto fake_args, 
-  //       xla::MakeFakeArguments(hlo_modules[0].get(), /*pseudo_random*/true,
-  //       /*use_large_range*/false));
+  // TF_ASSIGN_OR_RETURN(auto hlo_modules, executable->GetHloModules());
 
   auto param = LiteralUtil::CreateFull({}, num_ranks);
-
-  // Shape shape = ShapeUtil::MakeShape(dtype, {1});
-  //shape.mutable_layout()->set_memory_space(Layout::kDefaultMemorySpace);
-
   //PrimitiveTypeBitWidth
   PjRtDevice* const device = client.addressable_devices()[0];
  
+    // TF_ASSIGN_OR_RETURN(auto fake_args, 
+  //       xla::MakeFakeArguments(hlo_modules[0].get(), /*pseudo_random*/true,
+  //       /*use_large_range*/false));
   /*  std::normal_distribution<double> generator(mean, stddev);
   return CreateLiteralWithGenerator<type, NativeT>(
       shape, [&](absl::Span<const int64_t>) {
@@ -236,70 +208,78 @@ absl::Status NvshmemCollectiveRunAllReduce(
   TF_ASSIGN_OR_RETURN(auto result,
                         executable->Execute({{input.get()}}, ExecuteOptions()));
 
-  std::vector<std::unique_ptr<xla::PjRtBuffer>>& result_buffers = result[0];
+  auto& result_buffers = result[0];
+  TF_ASSIGN_OR_RETURN(auto output, result_buffers[0]->ToLiteralSync());
+  //VLOG(0) << "Got literal output " << output->ToString();
+  auto expected = LiteralUtil::CreateFull({}, 0.0f);
+  return literal_comparison::Near(expected, *output,
+                  ErrorSpec(1e-5, 1e-5), {}, nullptr);
+}
+
+absl::Status NvshmemRunCollectivePermute(
+      PjRtClient& client, uint32_t num_ranks, 
+      const CompileOptions& compile_options, PrimitiveType dtype) {
+
+  const char *kProgram = R"(HloModule Test
+addu {
+  x = u32[] parameter(0)
+  y = u32[] parameter(1)
+  ROOT apply_op = u32[] add(x, y)
+}
+ENTRY Xtest {
+  num_ranks = u32[] parameter(0)
+  ofs = u32[] constant(33)
+  id = u32[] replica-id()
+  idofs = u32[] add(id, ofs)
+  bcast = u32<<DIM>> broadcast(idofs), dimensions={}
+  bcastT = <<NT>><<DIM>> convert(bcast)
+  coll_permute = <<NT>><<DIM>> collective-permute(bcastT), source_target_pairs={<<PAIRS>>}, backend_config={"collective_backend_config":{"backend":"NVSHMEM"}}
+  done = u32<<DIM>> convert(coll_permute)
+  one = u32[] constant(1)
+  id_add = u32[] add(id, one)
+  rem = u32[] remainder(id_add, num_ranks)
+  add_ofs = u32[] add(rem, ofs)
+  truth = u32<<DIM>> broadcast(add_ofs), dimensions={}
+  sub = u32<<DIM>> subtract(done, truth)
+  zero = u32[] constant(0)
+  ROOT final = u32[] reduce(sub, zero), dimensions={0,1}, to_apply=addu
+})";
+  std::ostringstream sprogram;
+  {
+  std::ifstream ifs("input.hlo");
+  if (!ifs) return absl::InternalError("Ops wrong HLO file!");
+    sprogram << ifs.rdbuf();
+  }
+  std::stringstream channels;
+  for (uint32_t i = 0; i < num_ranks; i++) {
+    channels << '{' << (i == num_ranks-1 ? 0 : i + 1) << ',' << i << '}';
+    if (i < num_ranks-1) channels << ',';
+  }
+  auto dtype_str = primitive_util::LowercasePrimitiveTypeName(dtype);
+  auto hlo_text = absl::StrReplaceAll(kProgram, //sprogram.str(), 
+        {{"<<NT>>", dtype_str}, 
+         {"<<DIM>>", "[10,10]"},
+         {"<<PAIRS>>", channels.str()}});
+
+  TF_ASSIGN_OR_RETURN(auto executable,
+                      CompileExecutable(hlo_text, client, compile_options));
+
+  auto param = LiteralUtil::CreateFull({}, num_ranks);
+  auto *device = client.addressable_devices()[0];
+
+  TF_ASSIGN_OR_RETURN(
+      auto input, client.BufferFromHostLiteral(
+          param, *device->default_memory_space()));
+  
+  TF_ASSIGN_OR_RETURN(auto result,
+                        executable->Execute({{input.get()}}, ExecuteOptions()));
+
+  auto& result_buffers = result[0];
   TF_ASSIGN_OR_RETURN(auto output, result_buffers[0]->ToLiteralSync());
 
   VLOG(0) << "Got literal output " << output->ToString();
-  // switch (data_type) {
-  //     case xla::PrimitiveType::F32: {
-  //       std::vector<float> ref_data{20};
-  //       TF_RET_CHECK(literal->data<float>()[0] == ref_data[0]);
-  //       break;
-  //     }
-  //     case xla::PrimitiveType::F64: {
-  //       std::vector<double> ref_data{20};
-  //       TF_RET_CHECK(literal->data<double>()[0] == ref_data[0]);
-  //       break;
-  //     }
-  //     case xla::PrimitiveType::BF16: {
-  //       std::vector<Eigen::bfloat16> ref_data{20};
-  //       TF_RET_CHECK(literal->data<Eigen::bfloat16>()[0] == ref_data[0]);
-  //       break;
-  //     }
-  //     case xla::PrimitiveType::F16: {
-  //       std::vector<Eigen::half> ref_data{20};
-  //       TF_RET_CHECK(literal->data<Eigen::half>()[0] == ref_data[0]);
-  //       break;
-  //     }
-  //     case xla::PrimitiveType::U32: {
-  //       std::vector<uint32_t> ref_data{20};
-  //       TF_RET_CHECK(literal->data<uint32_t>()[0] == ref_data[0]);
-  //       break;
-  //     }
-  //     case xla::PrimitiveType::U64: {
-  //       std::vector<uint64_t> ref_data{20};
-  //       TF_RET_CHECK(literal->data<uint64_t>()[0] == ref_data[0]);
-  //       break;
-  //     }
-  //     case xla::PrimitiveType::S32: {
-  //       std::vector<int32_t> ref_data{20};
-  //       TF_RET_CHECK(literal->data<int32_t>()[0] == ref_data[0]);
-  //       break;
-  //     }
-  //     case xla::PrimitiveType::S64: {
-  //       std::vector<int64_t> ref_data{20};
-  //       TF_RET_CHECK(literal->data<int64_t>()[0] == ref_data[0]);
-  //       break;
-  //     }
-  //     case xla::PrimitiveType::PRED: {
-  //       std::vector<uint8_t> ref_data{20};
-  //       TF_RET_CHECK(literal->data<uint8_t>()[0] == ref_data[0]);
-  //       break;
-  //     }
-  //     case xla::PrimitiveType::S8: {
-  //       std::vector<int8_t> ref_data{20};
-  //       TF_RET_CHECK(literal->data<int8_t>()[0] == ref_data[0]);
-  //       break;
-  //     }
-  //     case xla::PrimitiveType::U8: {
-  //       std::vector<uint8_t> ref_data{20};
-  //       TF_RET_CHECK(literal->data<uint8_t>()[0] == ref_data[0]);
-  //       break;
-  //     }
-  //     default:
-  //       return absl::InvalidArgumentError("Invalida data type.");
-  //   }
-  return absl::OkStatus();
+  auto expected = LiteralUtil::CreateFull({}, (uint32_t)0);
+  return literal_comparison::Equal(expected, *output, nullptr);
 }
 
 absl::Status NvshmemCollectiveTestBody(int rank_id, int num_ranks,
@@ -335,7 +315,7 @@ absl::Status NvshmemCollectiveTestBody(int rank_id, int num_ranks,
 
   xla::CompileOptions options;
   options.executable_build_options.mutable_debug_options()
-      ->set_xla_gpu_experimental_enable_nvshmem(false);
+      ->set_xla_gpu_experimental_enable_nvshmem(true);
   // options.executable_build_options.set_run_backend_only(true);
   options.executable_build_options.set_use_spmd_partitioning(false);
   options.executable_build_options.set_num_replicas(num_ranks);
@@ -343,15 +323,7 @@ absl::Status NvshmemCollectiveTestBody(int rank_id, int num_ranks,
   std::string kProgram;
 
   if (test_case == "collective_permute") {
-    kProgram = R"(
-         HloModule NvshmemCollectivePermute
-        ENTRY test_computation {
-          data = <<NT>>[] constant(42)
-          start = (<<NT>>[], <<NT>>[]) collective-permute-start(data),
-                source_target_pairs={{0,1},{1,0}},
-                backend_config={"collective_backend_config":{"backend":"NVSHMEM"}}
-          ROOT done = <<NT>>[] collective-permute-done(start)
-        })";
+    return NvshmemRunCollectivePermute(*client, num_ranks, options, data_type);
   } else if (test_case == "send_recv") {
     kProgram = R"(
         HloModule NvshmemSendRecv
@@ -367,7 +339,7 @@ absl::Status NvshmemCollectiveTestBody(int rank_id, int num_ranks,
         })";
   } else if (test_case == "all_reduce") {
     VLOG(0) << "Running all reduce";
-    return NvshmemCollectiveRunAllReduce(*client, num_ranks, options, data_type);
+    return NvshmemRunAllReduce(*client, num_ranks, options, data_type);
   }
 
   TF_ASSIGN_OR_RETURN(auto executable,
@@ -381,45 +353,7 @@ absl::Status NvshmemCollectiveTestBody(int rank_id, int num_ranks,
   TF_ASSIGN_OR_RETURN(std::shared_ptr<xla::Literal> literal,
                       result_buffers[0]->ToLiteralSync());
 
-  if (test_case == "collective_permute") {
-    switch (data_type) {
-      case xla::PrimitiveType::F32: {
-        TF_RET_CHECK(literal->data<float>()[0] == 42.0f);
-        break;
-      }
-      case xla::PrimitiveType::F64: {
-        TF_RET_CHECK(literal->data<double>()[0] == 42.0);
-        break;
-      }
-      case xla::PrimitiveType::BF16: {
-        TF_RET_CHECK(literal->data<Eigen::bfloat16>()[0] ==
-                     Eigen::bfloat16(42));
-        break;
-      }
-      case xla::PrimitiveType::F16: {
-        TF_RET_CHECK(literal->data<Eigen::half>()[0] == Eigen::half(42));
-        break;
-      }
-      case xla::PrimitiveType::U32: {
-        TF_RET_CHECK(literal->data<uint32_t>()[0] == 42);
-        break;
-      }
-      case xla::PrimitiveType::U64: {
-        TF_RET_CHECK(literal->data<uint64_t>()[0] == 42);
-        break;
-      }
-      case xla::PrimitiveType::S32: {
-        TF_RET_CHECK(literal->data<int32_t>()[0] == 42);
-        break;
-      }
-      case xla::PrimitiveType::S64: {
-        TF_RET_CHECK(literal->data<int64_t>()[0] == 42);
-        break;
-      }
-      default:
-        return absl::InvalidArgumentError("Invalid data type.");
-    }
-  } else if (test_case == "send_recv" && rank_id == 1) {
+  if (test_case == "send_recv" && rank_id == 1) {
     switch (data_type) {
       case xla::PrimitiveType::F32: {
         float value = literal->data<float>()[0];
@@ -505,6 +439,8 @@ int main(int argc, char* argv[]) {
                                           test_case);
     if (!s.ok()) {
       VLOG(0) << "Failed with " << s;
+    } else {
+      VLOG(0) << "Test succeeded on rank " << rank_id;
     }
     return s.raw_code();
   }
