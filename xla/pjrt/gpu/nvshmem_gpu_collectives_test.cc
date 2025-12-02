@@ -171,7 +171,7 @@ absl::Status NvshmemRunAllReduce(
   auto dtype_str = primitive_util::LowercasePrimitiveTypeName(dtype);
   auto hlo_text = absl::StrReplaceAll(kProgram, //sprogram.str(), 
         {{"<<NT>>", dtype_str}, 
-         {"<<DIM>>", "[10,10]"} });
+         {"<<DIM>>", "[100,40]"} });
 
   TF_ASSIGN_OR_RETURN(auto executable,
                       CompileExecutable(hlo_text, client, compile_options));
@@ -258,7 +258,7 @@ ENTRY Xtest {
   auto dtype_str = primitive_util::LowercasePrimitiveTypeName(dtype);
   auto hlo_text = absl::StrReplaceAll(kProgram, //sprogram.str(), 
         {{"<<NT>>", dtype_str}, 
-         {"<<DIM>>", "[10,10]"},
+         {"<<DIM>>", "[10,20]"},
          {"<<PAIRS>>", channels.str()}});
 
   TF_ASSIGN_OR_RETURN(auto executable,
