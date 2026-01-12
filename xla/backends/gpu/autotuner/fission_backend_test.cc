@@ -36,13 +36,13 @@ limitations under the License.
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/service/compiler.h"
 #include "xla/service/executable.h"
-#include "xla/service/gpu/nvptx_compiler.h"
 #include "xla/service/gpu/transforms/custom_kernel_fusion_rewriter.h"
 #include "xla/service/gpu/transforms/dot_algorithm_rewriter.h"
 #include "xla/service/gpu/transforms/gemm_rewriter.h"
 #include "xla/service/gpu/transforms/scaled_dot_rewriter.h"
 #include "xla/service/platform_util.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/xla.pb.h"
@@ -202,9 +202,10 @@ class FissionTest : public HloHardwareIndependentTestBase,
 
  protected:
   DebugOptions debug_options_;
-  NVPTXCompiler compiler_;
+  se::Platform* platform_;
   se::StreamExecutor* stream_executor_;
   Compiler::GpuTargetConfig target_config_;
+  std::unique_ptr<Compiler> compiler_;
   se::DeviceDescription device_description_;
   std::unique_ptr<HloPassPipeline> rewriter_pipeline_;
   std::unique_ptr<GpuCodegenBackend> base_codegen_backend_;
@@ -212,17 +213,16 @@ class FissionTest : public HloHardwareIndependentTestBase,
   mlir::MLIRContext mlir_context_;
 
   FissionTest()
-      : stream_executor_(PlatformUtil::GetDefaultPlatform()
-                             .value()
-                             ->ExecutorForDevice(0)
-                             .value()),
+      : platform_(PlatformUtil::GetDefaultPlatform().value()),
+        stream_executor_(platform_->ExecutorForDevice(0).value()),
         target_config_(stream_executor_),
+        compiler_(Compiler::GetForPlatform(platform_).value()),
         device_description_(stream_executor_->GetDeviceDescription()),
         rewriter_pipeline_(GetParam().pipeline_factory(device_description_)),
         base_codegen_backend_(GetParam().backend_factory(
-            stream_executor_, &debug_options_, &compiler_, &target_config_)),
+            stream_executor_, &debug_options_, compiler_.get(), &target_config_)),
         fission_backend_(std::make_unique<FissionBackend>(
-            &debug_options_, &compiler_, &target_config_,
+            &debug_options_, compiler_.get(), &target_config_,
             std::move(base_codegen_backend_), std::move(rewriter_pipeline_),
             &mlir_context_, stream_executor_)) {}
 };
