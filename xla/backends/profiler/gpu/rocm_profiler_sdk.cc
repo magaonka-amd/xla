@@ -20,33 +20,27 @@ limitations under the License.
 // can replace the stubs with the actual logic.
 
 #include "xla/backends/profiler/gpu/rocm_profiler_sdk.h"
-#include "xla/backends/profiler/gpu/rocm_collector.h"
-#include "xla/backends/profiler/gpu/rocm_tracer_utils.h"
 
 #include <cstdint>
 #include <cstring>
-#include <map>
-#include <mutex>
-#include <sstream>
 #include <string>
 #include <unordered_map>
-#include <vector>
-#include <time.h>
 #include <unistd.h>
-#include <chrono>
-#include <unistd.h>  // For standard sysconf
+#include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/node_hash_map.h"
 #include "absl/strings/str_format.h"
-#include "xla/tsl/profiler/backends/cpu/annotation_stack.h"
-#include "xla/tsl/profiler/utils/time_utils.h"
 #include "tsl/platform/env.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/logging.h"
 #include "tsl/platform/macros.h"
 #include "tsl/platform/mem.h"
 #include "tsl/platform/stacktrace.h"
+#include "xla/backends/profiler/gpu/rocm_collector.h"
+#include "xla/backends/profiler/gpu/rocm_tracer_utils.h"
+#include "xla/tsl/profiler/backends/cpu/annotation_stack.h"
+#include "xla/tsl/profiler/utils/time_utils.h"
 
 // for rocprofiler-sdk
 namespace xla {
