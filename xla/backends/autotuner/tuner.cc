@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -55,6 +56,21 @@ limitations under the License.
 #include "xla/util.h"
 
 namespace xla {
+
+namespace {
+// [conv-zero] Console-only root-cause logging for the intermittent jax
+// testConvGeneralDilated all-zero WRW gradient on ROCm 4gpu CI. Gated by env so
+// it is a true no-op for normal builds/runs; when XLA_CONV_ZERO_DEBUG is set,
+// every diagnostic goes to stderr (LOG, captured by pytest under the failing
+// test) tagged [CZ-*] for grepping. No file output (CI cannot extract files).
+bool ConvZeroDebugEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("XLA_CONV_ZERO_DEBUG");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+}  // namespace
 
 absl::StatusOr<std::unique_ptr<Tuner>> Tuner::Create(
     std::unique_ptr<Profiler> profiler,
@@ -160,6 +176,12 @@ tsl::Future<Tuner::Config> Tuner::GetTunedConfig(const HloInstruction* instr) {
                                best_result.status().message()));
             }
             VLOG(1) << "Picked best config: " << best_result->ToString();
+            if (ConvZeroDebugEnabled()) {
+              LOG(WARNING) << "[CZ-AUTOTUNE-PICKED] instr=" << instr->name()
+                           << " shape=" << instr->shape().ToString()
+                           << " picked={" << best_result->ToString(/*verbose=*/true)
+                           << " cluster=" << best_result->cluster_index << "}";
+            }
             return std::move(best_result->config);
           });
 }
@@ -363,6 +385,21 @@ void Tuner::DemoteNonWinningClusterConfigs(
           << " cluster(s); selected cluster " << winner << " with "
           << clusters[winner].count
           << " member(s), trusted=" << clusters[winner].has_trusted_member;
+  if (ConvZeroDebugEnabled()) {
+    // If the autotuner's correctness clustering itself elected an all-zero
+    // output as the winning cluster, this is the smoking gun for a wrong
+    // selection. The per-cluster representative content fingerprint is emitted
+    // separately as [CZ-PROF] by the profiler (it owns the stream); here we log
+    // the cluster topology + winner so the two can be correlated.
+    std::string s;
+    for (int c = 0; c < clusters.size(); ++c) {
+      absl::StrAppend(&s, "\n  cluster[", c, "] count=", clusters[c].count,
+                      " trusted=", clusters[c].has_trusted_member,
+                      c == winner ? " <-- WINNER" : "");
+    }
+    LOG(WARNING) << "[CZ-CLUSTER] clusters=" << clusters.size()
+                 << " any_trusted=" << any_trusted << " winner=" << winner << s;
+  }
   for (ConfigResult& result : results) {
     if (!result.failure.has_value() && result.cluster_index != winner) {
       result.failure = Failure{
@@ -383,6 +420,28 @@ void Tuner::LogConfigResults(const HloInstruction& instr,
                              absl::Span<const ConfigResult> results) {
   for (const ConfigResult& result : results) {
     VLOG(2) << result.ToString(/*verbose=*/VLOG_IS_ON(3));
+  }
+  if (ConvZeroDebugEnabled()) {
+    // One line per autotuned instruction listing every candidate's backend,
+    // measured duration, scratch, output-cluster id and any failure (e.g.
+    // WRONG RESULTS / REDZONE). Lets us see, for the conv that later zeros,
+    // whether a numerically-wrong config was selected and which output cluster
+    // each candidate landed in. Covers all paths (incl. single-config /
+    // single-candidate / no-profiling).
+    std::string s;
+    for (const ConfigResult& r : results) {
+      absl::StrAppend(
+          &s, "\n  {backend=", r.config.codegen_backend->name(),
+          " dur=", absl::FormatDuration(r.duration),
+          " scratch=", r.scratch_bytes, " cluster=", r.cluster_index,
+          r.failure.has_value()
+              ? absl::StrCat(" FAILURE=", r.failure->ToString())
+              : "",
+          "}");
+    }
+    LOG(WARNING) << "[CZ-AUTOTUNE] instr=" << instr.name()
+                 << " shape=" << instr.shape().ToString() << " results("
+                 << results.size() << "):" << s;
   }
   if (options_.dump_logs_to.empty()) {
     return;

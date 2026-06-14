@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -65,6 +66,56 @@ namespace xla {
 namespace gpu {
 
 namespace {
+
+// [conv-zero] Console-only root-cause logging, gated by env (no-op otherwise).
+// See tuner.cc for the rationale. All output goes to stderr tagged [CZ-*].
+bool ConvZeroDebugEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("XLA_CONV_ZERO_DEBUG");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
+// Fingerprints the autotune profiling buffers for small (conv-sized) outputs:
+// logs the device addresses of every input buffer and, for each small output
+// leaf, its address, size and nonzero-byte count. An all-zero candidate output
+// during profiling (nonzero_bytes=0) means a config produced zeros at autotune
+// time; correlating the output address here with the runtime [CZ-CONV] address
+// tests whether an autotune buffer is later recycled into example-0's live wrw
+// output. Safe to copy+sync here: autotuning already synchronizes the stream.
+void MaybeLogProfileBuffers(se::Stream* stream,
+                            const RedzoneBuffers& rz_buffers,
+                            ScopedShapedBuffer& output) {
+  if (!ConvZeroDebugEnabled()) {
+    return;
+  }
+  constexpr uint64_t kMaxBytes = 5000;
+  std::string inputs;
+  for (const se::DeviceAddressBase& b : rz_buffers.input_buffers()) {
+    absl::StrAppendFormat(&inputs, " in=%p(%d)", b.opaque(), b.size());
+  }
+  ShapeUtil::ForEachLeafShape(
+      output.on_device_shape(),
+      [&](const Shape& subshape, const ShapeIndex& index) {
+        const se::DeviceAddressBase& buf = output.buffer(index);
+        if (buf.size() == 0 || buf.size() > kMaxBytes) {
+          return;
+        }
+        std::vector<uint8_t> host(buf.size());
+        if (!stream->Memcpy(host.data(), buf, buf.size()).ok() ||
+            !stream->BlockHostUntilDone().ok()) {
+          return;
+        }
+        uint64_t nonzero = 0;
+        for (uint8_t byte : host) {
+          nonzero += (byte != 0);
+        }
+        LOG(WARNING) << absl::StrFormat(
+            "[CZ-PROF] out=%p out_bytes=%d nonzero_bytes=%d inputs:%s",
+            buf.opaque(), buf.size(), nonzero, inputs);
+      });
+}
 
 std::vector<ExecutionInput> CreateExecutionInputsFromBuffers(
     absl::Span<se::DeviceAddressBase const> buffers,
@@ -292,6 +343,7 @@ absl::StatusOr<ProfileResult> GpuProfiler::Profile(
 
   result.duration = absl::Nanoseconds(profile.compute_time_ns());
   result.output_buffer = execution_output.Commit().ConsumeResult();
+  MaybeLogProfileBuffers(stream_, rz_buffers, result.output_buffer.value());
   return result;
 }
 

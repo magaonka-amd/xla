@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <tuple>
 #include <type_traits>
@@ -50,6 +51,19 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 namespace {
+
+// [conv-zero] Console-only root-cause logging, gated by env (no-op otherwise).
+// See tuner.cc. NOTE: this runtime path is timing-sensitive — the flake needs
+// async overlap to manifest — so we log addresses/algorithm ONLY (no sync, no
+// device->host copy) to avoid masking the bug. Content inspection at runtime is
+// opt-in via XLA_CONV_ZERO_DUMP (separate, perturbing) for a confirmation run.
+bool ConvZeroDebugEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("XLA_CONV_ZERO_DEBUG");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
 
 using se::DeviceAddress;
 using se::DeviceAddressBase;
@@ -600,6 +614,24 @@ absl::Status RunGpuConv(const gpu::GpuConvConfig& config,
                         absl::Span<const se::DeviceAddressBase> result_buffers,
                         se::DeviceAddressBase scratch_memory,
                         se::Stream* stream, RunConvOptions options) {
+  if (ConvZeroDebugEnabled() && !result_buffers.empty() &&
+      result_buffers[0].size() <= 5000) {
+    // Non-perturbing runtime trace for the small convs of testConvGeneralDilated
+    // (fwd y{10,5,5,5}=5000B / y{1,5,5,5}=500B, wrw dw{5,1,3,3}=180B). RunGpuConv
+    // runs both at autotune-profiling time and at runtime; matching a runtime
+    // output address to a [CZ-PROF]/[CZ-BFC] address proves buffer recycling,
+    // and the algorithm id tells us which solver actually ran for example 0.
+    LOG_FIRST_N(WARNING, 20000)
+        << "[CZ-CONV] kind=" << CudnnConvKindToString(config.kind)
+        << " algo=" << config.algorithm.ToString()
+        << " out=" << result_buffers[0].opaque()
+        << " out_bytes=" << result_buffers[0].size() << " in0="
+        << (operand_buffers.empty() ? nullptr : operand_buffers[0].opaque())
+        << " in1="
+        << (operand_buffers.size() < 2 ? nullptr : operand_buffers[1].opaque())
+        << " scratch=" << scratch_memory.opaque();
+  }
+
   ASSIGN_OR_RETURN(GpuConvParams params,
                    GetGpuConvParams(config, operand_buffers, result_buffers));
 

@@ -51,6 +51,24 @@ limitations under the License.
 
 namespace tsl {
 
+namespace {
+// [conv-zero] Console-only allocator tracing for the conv-zero root-cause hunt.
+// Separate (higher-volume) gate from XLA_CONV_ZERO_DEBUG so it is opt-in for a
+// focused run. When set, logs reuse of small (conv-sized) chunks tagged
+// [CZ-BFC], including whether a stream-completion frontier guards the reuse
+// (timing_active) and the chunk's freed_at_count vs the requested freed_before.
+// A reuse with timing_active=0 / freed_before=0 means a freed buffer can be
+// handed out again with no guarantee its prior async GPU work has completed —
+// exactly the "BFC reuses memory while a kernel is in flight" hypothesis.
+bool ConvZeroBfcEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("XLA_CONV_ZERO_BFC");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+}  // namespace
+
 const uint64_t kDefaultMemoryFilterMask = tsl::profiler::TraceMeFiltersToMask(
     {tsl::profiler::TraceMeFilter::kTraceMemory});
 
@@ -682,6 +700,16 @@ void* BFCAllocator::FindChunkPtr(BinNum bin_num, size_t rounded_bytes,
         VLOG(4) << "Returning: " << chunk->ptr;
         if (VLOG_IS_ON(4)) {
           LOG(INFO) << "A: " << RenderOccupancy();
+        }
+        if (ConvZeroBfcEnabled() && rounded_bytes <= 8192) {
+          LOG_FIRST_N(WARNING, 50000)
+              << "[CZ-BFC] reuse addr=" << chunk->ptr
+              << " size=" << chunk->size << " requested=" << num_bytes
+              << " alloc_id=" << chunk->allocation_id
+              << " freed_at_count=" << chunk->freed_at_count
+              << " freed_before=" << freed_before
+              << " timing_active=" << (timing_counter_ != nullptr)
+              << " allocator=" << Name();
         }
         return chunk->ptr;
       }
