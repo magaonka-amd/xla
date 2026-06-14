@@ -255,7 +255,7 @@ absl::Status RocmStream::Memset32(DeviceAddressBase* location, uint32_t pattern,
   if (size % sizeof(uint32_t) != 0) {
     return absl::InvalidArgumentError("size must be a multiple of 4 bytes.");
   }
-  if (ConvZeroDebugEnabled() && size <= 8192) {
+  if (ConvZeroDebugEnabled() && size <= 512) {
     // [CZ-MEMSET] every small device memset (incl. the aligned MemZero path,
     // which routes here with pattern=0). Correlate addr with the runtime wrw
     // output [CZ-CONV] out= and the [CZ-BFC]/[CZ-BFC-FREE] recycle of that addr
@@ -274,7 +274,7 @@ absl::Status RocmStream::MemZero(DeviceAddressBase* location, uint64_t size) {
       size % sizeof(uint32_t) == 0) {
     return Memset32(location, 0x0, size);
   } else {
-    if (ConvZeroDebugEnabled() && size <= 8192) {
+    if (ConvZeroDebugEnabled() && size <= 512) {
       LOG_FIRST_N(WARNING, 50000)
           << "[CZ-MEMSET] addr=" << location->opaque() << " size=" << size
           << " pattern=0 (unaligned)";

@@ -92,7 +92,12 @@ class AllocatedRawSEDeviceMemory : public RawSEDeviceMemory {
         LocalDeviceState::kComputeSynchronized) {
       sync_point_ = local_device_->GetNextComputeStreamSyncPoint();
     }
-    if (ConvZeroDebugEnabled() && mem().size() > 0 && mem().size() <= 8192) {
+    // Tight size gate (<=512B: dW=180B result, fwd=500B) to keep volume minimal.
+    // Only the constructor is instrumented; the matching free is already captured
+    // by [CZ-BFC-FREE] when the dtor's allocator->Deallocate reaches BFC. We do
+    // NOT log from the destructor: a dtor firing during a crashing worker's
+    // teardown could deadlock on the logging mutex (observed as hung workers).
+    if (ConvZeroDebugEnabled() && mem().size() > 0 && mem().size() <= 512) {
       LOG_FIRST_N(WARNING, 20000)
           << "[CZ-RAW-NEW] addr=" << mem().opaque() << " size=" << mem().size()
           << " sync_point=" << sync_point_;
@@ -101,15 +106,6 @@ class AllocatedRawSEDeviceMemory : public RawSEDeviceMemory {
 
   ~AllocatedRawSEDeviceMemory() override {
     if (allocator_) {
-      if (ConvZeroDebugEnabled() && mem().size() > 0 && mem().size() <= 8192) {
-        // The memory is returned to BFC HERE, synchronously, with no wait on
-        // sync_point_/definition event. If this fires for example-0's dW result
-        // address during the loop (before the final concat reads it), it is a
-        // premature free of a live result buffer (use-after-free).
-        LOG_FIRST_N(WARNING, 20000)
-            << "[CZ-RAW-FREE] addr=" << mem().opaque()
-            << " size=" << mem().size() << " sync_point=" << sync_point_;
-      }
       absl::Status status = allocator_->Deallocate(
           local_device_->local_device_id().value(), mem());
       if (!status.ok()) {

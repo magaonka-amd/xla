@@ -701,7 +701,7 @@ void* BFCAllocator::FindChunkPtr(BinNum bin_num, size_t rounded_bytes,
         if (VLOG_IS_ON(4)) {
           LOG(INFO) << "A: " << RenderOccupancy();
         }
-        if (ConvZeroBfcEnabled() && rounded_bytes <= 8192) {
+        if (ConvZeroBfcEnabled() && rounded_bytes <= 512) {
           LOG_FIRST_N(WARNING, 50000)
               << "[CZ-BFC] reuse addr=" << chunk->ptr
               << " size=" << chunk->size << " requested=" << num_bytes
@@ -783,7 +783,7 @@ void BFCAllocator::DeallocateRawInternal(void* ptr) {
   int64_t req_bytes = chunk->requested_size;
   int64_t alloc_bytes = chunk->size;
 
-  if (ConvZeroBfcEnabled() && alloc_bytes <= 8192) {
+  if (ConvZeroBfcEnabled() && alloc_bytes <= 512) {
     // [CZ-BFC-FREE] free of a small chunk. Pairs with [CZ-BFC] reuse to bound
     // the window in which example-0's wrw output address is freed and handed
     // out again; timing_active=false here means no stream-completion frontier
