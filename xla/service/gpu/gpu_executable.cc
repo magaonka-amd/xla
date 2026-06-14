@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -143,6 +144,19 @@ limitations under the License.
 
 namespace xla::gpu {
 namespace {
+
+// [conv-zero] Console-only diagnostic gate (no-op unless XLA_CONV_ZERO_DEBUG is
+// set). Round 3: trace each executable's small OUTPUT result buffers so we can
+// identify example-0's dW result buffer (= transpose(conv_output), the actual
+// all-zero victim) and correlate its address with [CZ-BFC-FREE]/[CZ-BFC] to see
+// whether a LIVE result buffer is freed/recycled before the final stack reads it.
+bool ConvZeroDebugEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("XLA_CONV_ZERO_DEBUG");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
 
 std::optional<absl::flat_hash_map<std::string, const HloInstruction*>>
 MakeConstantsMap(HloModule* absl_nullable debug_module) {
@@ -1459,6 +1473,27 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
   // Free allocations for arguments.
   if (auto args = std::get_if<absl::Span<ExecutionInput>>(&arguments)) {
     MarkToBeReleasedArguments(*args, result);
+  }
+
+  if (ConvZeroDebugEnabled()) {
+    // [CZ-EXEC] per-execution small result buffers (addr/size/shape-index) +
+    // module name. The example-0 dW grad executable emits a 180B output; its
+    // address, cross-referenced with [CZ-BFC-FREE]/[CZ-BFC], reveals whether the
+    // live result buffer is freed and recycled before the final stack consumes it.
+    std::string outs;
+    for (auto& p : result.MutableResult()->buffers()) {
+      const se::DeviceAddressBase& b = p.second;
+      if (b.opaque() == nullptr || b.size() == 0 || b.size() > 8192) {
+        continue;
+      }
+      absl::StrAppendFormat(&outs, " out=%p(%d)@%s", b.opaque(), b.size(),
+                            p.first.ToString());
+    }
+    if (!outs.empty()) {
+      LOG_FIRST_N(WARNING, 20000)
+          << "[CZ-EXEC] module=" << module_name_ << " result_shape="
+          << result.MutableResult()->on_device_shape().ToString() << outs;
+    }
   }
   return std::move(result);
 }
