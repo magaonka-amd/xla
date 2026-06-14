@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/stream_executor/rocm/rocm_stream.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -50,6 +51,17 @@ limitations under the License.
 
 namespace stream_executor::gpu {
 namespace {
+
+// [conv-zero] Console-only diagnostic gate (no-op unless XLA_CONV_ZERO_DEBUG is
+// set). Used to trace small device memsets/memzeros — the prime suspect for the
+// write that zeros example-0's wrw output buffer in jax testConvGeneralDilated.
+bool ConvZeroDebugEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("XLA_CONV_ZERO_DEBUG");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
 
 absl::StatusOr<hipStream_t> CreateStream(StreamExecutor* executor,
                                          int priority) {
@@ -243,6 +255,15 @@ absl::Status RocmStream::Memset32(DeviceAddressBase* location, uint32_t pattern,
   if (size % sizeof(uint32_t) != 0) {
     return absl::InvalidArgumentError("size must be a multiple of 4 bytes.");
   }
+  if (ConvZeroDebugEnabled() && size <= 8192) {
+    // [CZ-MEMSET] every small device memset (incl. the aligned MemZero path,
+    // which routes here with pattern=0). Correlate addr with the runtime wrw
+    // output [CZ-CONV] out= and the [CZ-BFC]/[CZ-BFC-FREE] recycle of that addr
+    // to prove a zero-write landing on example-0's wrw result.
+    LOG_FIRST_N(WARNING, 50000)
+        << "[CZ-MEMSET] addr=" << location->opaque() << " size=" << size
+        << " pattern=" << pattern;
+  }
   return ToStatus(
       hipMemsetD32Async(location->opaque(), pattern, size / 4, stream_handle_),
       "Failed to memset memory");
@@ -253,6 +274,11 @@ absl::Status RocmStream::MemZero(DeviceAddressBase* location, uint64_t size) {
       size % sizeof(uint32_t) == 0) {
     return Memset32(location, 0x0, size);
   } else {
+    if (ConvZeroDebugEnabled() && size <= 8192) {
+      LOG_FIRST_N(WARNING, 50000)
+          << "[CZ-MEMSET] addr=" << location->opaque() << " size=" << size
+          << " pattern=0 (unaligned)";
+    }
     std::unique_ptr<ActivateContext> activation = executor_->Activate();
     return ToStatus(
         hipMemsetAsync(location->opaque(), 0x0, size, stream_handle_),

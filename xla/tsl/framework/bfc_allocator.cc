@@ -783,6 +783,18 @@ void BFCAllocator::DeallocateRawInternal(void* ptr) {
   int64_t req_bytes = chunk->requested_size;
   int64_t alloc_bytes = chunk->size;
 
+  if (ConvZeroBfcEnabled() && alloc_bytes <= 8192) {
+    // [CZ-BFC-FREE] free of a small chunk. Pairs with [CZ-BFC] reuse to bound
+    // the window in which example-0's wrw output address is freed and handed
+    // out again; timing_active=false here means no stream-completion frontier
+    // guards the reuse.
+    LOG_FIRST_N(WARNING, 50000)
+        << "[CZ-BFC-FREE] addr=" << chunk_ptr << " size=" << alloc_bytes
+        << " requested=" << req_bytes << " alloc_id=" << chunk->allocation_id
+        << " timing_active=" << (timing_counter_ != nullptr)
+        << " allocator=" << Name();
+  }
+
   MarkFree(h);
 
   // Consider coalescing it.
