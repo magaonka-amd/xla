@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/pjrt/tracked_device_buffer.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <utility>
 
@@ -49,6 +50,23 @@ limitations under the License.
 
 namespace xla {
 
+namespace {
+// [conv-zero] Console-only diagnostic gate (no-op unless XLA_CONV_ZERO_DEBUG is
+// set). Round 4: trace the lifetime of PJRT-managed device buffers
+// (AllocatedRawSEDeviceMemory ctor/dtor) so we can pin example-0's dW RESULT
+// buffer (180B) and see whether its memory is returned to the BFC allocator
+// (the dtor calls allocator->Deallocate immediately, NOT waiting on sync_point_)
+// during the per_example_direct loop while the Python list still holds it alive
+// -> use-after-free of a live result. Correlate addr with [CZ-BFC]/[CZ-BFC-FREE].
+bool ConvZeroDebugEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("XLA_CONV_ZERO_DEBUG");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+}  // namespace
+
 ShapedBuffer RawSEDeviceMemory::AsShapedBuffer(
     PjRtDevice* device, const Shape& on_device_shape) const {
   ShapedBuffer shaped_buffer(on_device_shape, device->local_device_id().value(),
@@ -74,10 +92,24 @@ class AllocatedRawSEDeviceMemory : public RawSEDeviceMemory {
         LocalDeviceState::kComputeSynchronized) {
       sync_point_ = local_device_->GetNextComputeStreamSyncPoint();
     }
+    if (ConvZeroDebugEnabled() && mem().size() > 0 && mem().size() <= 8192) {
+      LOG_FIRST_N(WARNING, 20000)
+          << "[CZ-RAW-NEW] addr=" << mem().opaque() << " size=" << mem().size()
+          << " sync_point=" << sync_point_;
+    }
   }
 
   ~AllocatedRawSEDeviceMemory() override {
     if (allocator_) {
+      if (ConvZeroDebugEnabled() && mem().size() > 0 && mem().size() <= 8192) {
+        // The memory is returned to BFC HERE, synchronously, with no wait on
+        // sync_point_/definition event. If this fires for example-0's dW result
+        // address during the loop (before the final concat reads it), it is a
+        // premature free of a live result buffer (use-after-free).
+        LOG_FIRST_N(WARNING, 20000)
+            << "[CZ-RAW-FREE] addr=" << mem().opaque()
+            << " size=" << mem().size() << " sync_point=" << sync_point_;
+      }
       absl::Status status = allocator_->Deallocate(
           local_device_->local_device_id().value(), mem());
       if (!status.ok()) {
