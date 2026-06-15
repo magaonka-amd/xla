@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <tuple>
 #include <type_traits>
@@ -60,6 +61,19 @@ namespace {
 bool ConvZeroDebugEnabled() {
   static const bool enabled = [] {
     const char* v = std::getenv("XLA_CONV_ZERO_DEBUG");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
+// PERTURBING dump gate (opt-in, separate). When XLA_CONV_ZERO_DUMP is set, after
+// each small backward_filter conv we sync the stream and copy the conv output (and
+// inputs) to host to see WHERE example-0's zero is born (conv output already zero?
+// inputs zero?) AND whether forcing completion makes the flake disappear
+// (= read-before-write confirmed). Gated to the dW conv only to bound perturbation.
+bool ConvZeroDumpEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("XLA_CONV_ZERO_DUMP");
     return v != nullptr && v[0] != '\0' && v[0] != '0';
   }();
   return enabled;
@@ -636,6 +650,7 @@ absl::Status RunGpuConv(const gpu::GpuConvConfig& config,
                    GetGpuConvParams(config, operand_buffers, result_buffers));
 
   PrimitiveType input_primitive_type = config.input_type;
+  auto run_conv = [&]() -> absl::Status {
   switch (input_primitive_type) {
     case F8E4M3FN:
       if (config.kind != CudnnConvKind::kForwardGraph) {
@@ -679,6 +694,38 @@ absl::Status RunGpuConv(const gpu::GpuConvConfig& config,
     default:
       return Unimplemented("Unimplemented convolution");
   }
+  };  // run_conv
+
+  absl::Status conv_status = run_conv();
+
+  if (ConvZeroDumpEnabled() && conv_status.ok() &&
+      config.kind == CudnnConvKind::kBackwardFilter && !result_buffers.empty() &&
+      result_buffers[0].size() <= 200) {
+    // [CZ-DUMP] PERTURBING: sync after the dW conv, then D2H the conv output and
+    // inputs. nonzero=0 on the output => the conv itself produced zero (look at
+    // inputs); nonzero>0 => the zero is born downstream (transpose/reshape). If
+    // this added sync makes testConvGeneralDilated stop failing -> read-before-
+    // write confirmed.
+    if (stream->BlockHostUntilDone().ok()) {
+      auto dump = [&](const char* tag, const se::DeviceAddressBase& b) {
+        if (b.opaque() == nullptr || b.size() == 0 || b.size() > 2048) return;
+        std::vector<uint8_t> host(b.size());
+        if (!stream->Memcpy(host.data(), b, b.size()).ok()) return;
+        if (!stream->BlockHostUntilDone().ok()) return;
+        uint64_t nonzero = 0;
+        for (uint8_t byte : host) nonzero += (byte != 0);
+        float f0 = 0.0f;
+        if (b.size() >= sizeof(float)) std::memcpy(&f0, host.data(), sizeof(float));
+        LOG_FIRST_N(WARNING, 5000)
+            << "[CZ-DUMP] " << tag << " addr=" << b.opaque()
+            << " bytes=" << b.size() << " nonzero=" << nonzero << " f0=" << f0;
+      };
+      dump("wrw_out", result_buffers[0]);
+      if (!operand_buffers.empty()) dump("in0", operand_buffers[0]);
+      if (operand_buffers.size() >= 2) dump("in1", operand_buffers[1]);
+    }
+  }
+  return conv_status;
 }
 
 absl::StatusOr<GpuConvDescriptor> GpuConvDescriptor::FromProto(
