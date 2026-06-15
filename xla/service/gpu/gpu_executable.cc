@@ -158,6 +158,15 @@ bool ConvZeroDebugEnabled() {
   return enabled;
 }
 
+// testConvGeneralDilated runs op-by-op: each primitive is its own tiny executable.
+// Gate capture by module name to fire ONLY for the dW chain (conv -> reshape ->
+// concatenate) in the runtime worker, so it survives the per-test stderr capture.
+bool ConvZeroModuleMatch(const std::string& name) {
+  return name.find("conv_general_dilated") != std::string::npos ||
+         name.find("reshape") != std::string::npos ||
+         name.find("concatenate") != std::string::npos;
+}
+
 std::optional<absl::flat_hash_map<std::string, const HloInstruction*>>
 MakeConstantsMap(HloModule* absl_nullable debug_module) {
   if (!debug_module) {
@@ -1323,21 +1332,12 @@ absl::StatusOr<ScopedShapedBuffer> GpuExecutable::ExecuteAsyncOnStream(
 absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
     const ServiceExecutableRunOptions* run_options,
     VariantArguments arguments) {
-  if (ConvZeroDebugEnabled()) {
-    // [CZ-ENTER] probe: does the runtime worker enter ExecuteAsyncOnStreamImpl
-    // for the conv test's executable? Gated to executables that own a 180B
-    // allocation (= the dW, distinctive to testConvGeneralDilated) so it survives
-    // the per-test stderr capture (ungated probes get consumed by earlier tests).
-    bool cz_has_dw = false;
-    for (const auto* a : GetAllocations()) {
-      if (a->size() == 180) {
-        cz_has_dw = true;
-        break;
-      }
-    }
-    if (cz_has_dw) {
-      LOG_FIRST_N(WARNING, 20000) << "[CZ-ENTER] module=" << module_name_;
-    }
+  if (ConvZeroDebugEnabled() && ConvZeroModuleMatch(module_name_)) {
+    // [CZ-ENTER] confirmed: the runtime worker enters ExecuteAsyncOnStreamImpl for
+    // the dW-chain executables. Log the result shape so we know each op's output.
+    LOG_FIRST_N(WARNING, 20000)
+        << "[CZ-ENTER] module=" << module_name_
+        << " result_shape=" << program_shape_.result().ToString();
   }
   XLA_SCOPED_LOGGING_TIMER(absl::StrCat(
       "GpuExecutable::ExecuteAsyncOnStreamImpl(", module_name_, ")"));
@@ -1494,15 +1494,13 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
         result.AddAliasedIndex(index);
       }
     }
-    if (ConvZeroDebugEnabled() && !result_buffer.is_null() &&
-        result_buffer.size() > 0 && result_buffer.size() <= 2048) {
-      // [CZ-OUT] the executable's live-out (output) buffer address, logged in
-      // the output-assignment loop which runs in the RUNTIME worker (it precedes
-      // ExecuteThunks, whose convs emit [CZ-CONV] there). Catches example-0's dW
-      // result address (180B) that the executable-tail/PJRT instrumentation
-      // missed; correlate with [CZ-BFC-FREE]/[CZ-BFC] to see if it is freed/
-      // recycled during the loop (use-after-free) vs stays alive (read-before-
-      // write).
+    if (ConvZeroDebugEnabled() && ConvZeroModuleMatch(module_name_) &&
+        !result_buffer.is_null()) {
+      // [CZ-OUT] the dW-chain executable's live-out (output) buffer address.
+      // Module-name gated (any output size) so it reliably captures example-0's
+      // dW result address in the runtime worker; correlate with [CZ-BFC-FREE]/
+      // [CZ-BFC] to see if it is freed/recycled while the Python list still holds
+      // it (use-after-free) vs stays alive (read-before-write).
       LOG_FIRST_N(WARNING, 20000)
           << "[CZ-OUT] module=" << module_name_
           << " idx=" << index.ToString() << " out=" << result_buffer.opaque()
