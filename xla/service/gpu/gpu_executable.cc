@@ -600,10 +600,21 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
     bool collective_use_minimal_resource) {
   if (ConvZeroDebugEnabled()) {
     // [CZ-THUNKS] probe: ExecuteThunksImpl runs the thunks (incl. the convs that
-    // emit [CZ-CONV]). Pairs with [CZ-ENTER] (top of ExecuteAsyncOnStreamImpl)
-    // to locate where the runtime worker's path diverges from the instrumented
-    // executable boundary.
-    LOG_FIRST_N(WARNING, 400) << "[CZ-THUNKS] module=" << module_name;
+    // emit [CZ-CONV]). Gated to executables owning a 180B allocation (the dW) so
+    // it survives the per-test stderr capture. Pairs with [CZ-ENTER]: if
+    // [CZ-THUNKS] appears in the conv worker but [CZ-ENTER] does not, the runtime
+    // reaches the thunks via a path other than ExecuteAsyncOnStreamImpl
+    // (command-buffer/graph replay).
+    bool cz_has_dw = false;
+    for (const auto* a : GetAllocations()) {
+      if (a->size() == 180) {
+        cz_has_dw = true;
+        break;
+      }
+    }
+    if (cz_has_dw) {
+      LOG_FIRST_N(WARNING, 20000) << "[CZ-THUNKS] module=" << module_name;
+    }
   }
   bool mock_collectives =
       run_options->run_options().gpu_executable_run_options()
@@ -1312,10 +1323,20 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
     const ServiceExecutableRunOptions* run_options,
     VariantArguments arguments) {
   if (ConvZeroDebugEnabled()) {
-    // [CZ-ENTER] probe: does the runtime worker enter ExecuteAsyncOnStreamImpl?
-    // If [CZ-THUNKS] fires for a module here but [CZ-ENTER] does not, the runtime
-    // reaches the thunks via a different entry (e.g. command-buffer/graph replay).
-    LOG_FIRST_N(WARNING, 400) << "[CZ-ENTER] module=" << module_name_;
+    // [CZ-ENTER] probe: does the runtime worker enter ExecuteAsyncOnStreamImpl
+    // for the conv test's executable? Gated to executables that own a 180B
+    // allocation (= the dW, distinctive to testConvGeneralDilated) so it survives
+    // the per-test stderr capture (ungated probes get consumed by earlier tests).
+    bool cz_has_dw = false;
+    for (const auto* a : GetAllocations()) {
+      if (a->size() == 180) {
+        cz_has_dw = true;
+        break;
+      }
+    }
+    if (cz_has_dw) {
+      LOG_FIRST_N(WARNING, 20000) << "[CZ-ENTER] module=" << module_name_;
+    }
   }
   XLA_SCOPED_LOGGING_TIMER(absl::StrCat(
       "GpuExecutable::ExecuteAsyncOnStreamImpl(", module_name_, ")"));
