@@ -1968,6 +1968,17 @@ static absl::Status CheckAlignment(const BufferAllocation& allocation,
 }
 #endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_SYCL
 
+// [conv-zero] Console-only diagnostic gate (no-op unless XLA_CONV_ZERO_DEBUG set).
+// This op-by-op RunAsync override IS the runtime execution path (calls
+// ExecuteThunks directly; ExecuteAsyncOnStreamImpl is never entered at runtime).
+static bool ConvZeroDebugEnabledSeGpu() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("XLA_CONV_ZERO_DEBUG");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
 absl::StatusOr<PjRtStreamExecutorExecutionOutput>
 StreamExecutorGpuClient::RunAsync(
     LocalExecutable& exec, PjRtDevice* device,
@@ -2191,11 +2202,26 @@ StreamExecutorGpuClient::RunAsync(
     }
     buffers_in_result.insert(result_buffer);
 
-    RawSEDeviceMemory::ConstructDelayed(
-        buf, result_buffer,
+    auto* cz_lds =
         tensorflow::down_cast<PjRtStreamExecutorDevice*>(device)
-            ->local_device_state(),
-        memory_allocator);
+            ->local_device_state();
+    if (ConvZeroDebugEnabledSeGpu() && !result_buffer.is_null() &&
+        result_buffer.size() > 0 && result_buffer.size() <= 2048) {
+      // [CZ-RT] the RUNTIME output buffer (this op-by-op path is what actually
+      // executes; ExecuteAsyncOnStreamImpl is never entered at runtime). Logs the
+      // dW-chain output addr/size + the definition sync_point captured by the
+      // ConstructDelayed below -- which happens BEFORE ExecuteThunks enqueues the
+      // producing kernel. Correlate the example-0 dW addr with [CZ-BFC-FREE]/
+      // [CZ-BFC] (UAF vs read-before-write) and the sync_point with the conv.
+      LOG_FIRST_N(WARNING, 20000)
+          << "[CZ-RT] result_shape=" << gpu_exec->result_shape().ToString()
+          << " idx=" << index.ToString() << " out=" << result_buffer.opaque()
+          << " size=" << result_buffer.size()
+          << " sync_point=" << cz_lds->GetNextComputeStreamSyncPoint();
+    }
+
+    RawSEDeviceMemory::ConstructDelayed(buf, result_buffer, cz_lds,
+                                        memory_allocator);
     return absl::OkStatus();
   };
 
