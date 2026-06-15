@@ -2234,6 +2234,22 @@ StreamExecutorGpuClient::RunAsync(
     RETURN_IF_ERROR(set_result({}, 0));
   }
 
+  // [conv-zero FIX] Defensively wait on every input buffer's definition event on
+  // the execution stream before running the thunks. CONFIRMED root cause: on the
+  // cold first op-by-op iteration the conv read its inputs (x, dy) before the
+  // producing op's write was visible -> all-zero inputs -> all-zero dW
+  // (testConvGeneralDilated example 0). This guarantees each input's producer has
+  // completed (its definition event is waited on this executable's compute
+  // stream) before the thunks read it.
+  for (const auto& arg : flat_arguments) {
+    if (arg.get() == nullptr) {
+      continue;
+    }
+    RETURN_IF_ERROR(WaitForAllocation(
+        run_options->stream(),
+        *tensorflow::down_cast<const PjRtStreamExecutorRawBuffer*>(arg.get())));
+  }
+
   RETURN_IF_ERROR(gpu_exec->ExecuteThunks(buffer_allocations, run_options));
 
   RETURN_IF_ERROR(buffer_allocations.TearDown(buffers_in_result,
