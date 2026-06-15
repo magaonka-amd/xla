@@ -604,10 +604,11 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
     // it survives the per-test stderr capture. Pairs with [CZ-ENTER]: if
     // [CZ-THUNKS] appears in the conv worker but [CZ-ENTER] does not, the runtime
     // reaches the thunks via a path other than ExecuteAsyncOnStreamImpl
-    // (command-buffer/graph replay).
+    // (command-buffer/graph replay). ExecuteThunksImpl is static, so gate via
+    // the buffer_allocations param (not GetAllocations()).
     bool cz_has_dw = false;
-    for (const auto* a : GetAllocations()) {
-      if (a->size() == 180) {
+    for (const se::DeviceAddressBase& b : buffer_allocations.buffers()) {
+      if (b.size() == 180) {
         cz_has_dw = true;
         break;
       }
