@@ -598,6 +598,13 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
     GpuExecutable::NumAdditionalStreams num_additional_streams,
     CollectiveMemoryCache& collective_memory_cache,
     bool collective_use_minimal_resource) {
+  if (ConvZeroDebugEnabled()) {
+    // [CZ-THUNKS] probe: ExecuteThunksImpl runs the thunks (incl. the convs that
+    // emit [CZ-CONV]). Pairs with [CZ-ENTER] (top of ExecuteAsyncOnStreamImpl)
+    // to locate where the runtime worker's path diverges from the instrumented
+    // executable boundary.
+    LOG_FIRST_N(WARNING, 400) << "[CZ-THUNKS] module=" << module_name;
+  }
   bool mock_collectives =
       run_options->run_options().gpu_executable_run_options()
           ? run_options->run_options()
@@ -1304,6 +1311,12 @@ absl::StatusOr<ScopedShapedBuffer> GpuExecutable::ExecuteAsyncOnStream(
 absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
     const ServiceExecutableRunOptions* run_options,
     VariantArguments arguments) {
+  if (ConvZeroDebugEnabled()) {
+    // [CZ-ENTER] probe: does the runtime worker enter ExecuteAsyncOnStreamImpl?
+    // If [CZ-THUNKS] fires for a module here but [CZ-ENTER] does not, the runtime
+    // reaches the thunks via a different entry (e.g. command-buffer/graph replay).
+    LOG_FIRST_N(WARNING, 400) << "[CZ-ENTER] module=" << module_name_;
+  }
   XLA_SCOPED_LOGGING_TIMER(absl::StrCat(
       "GpuExecutable::ExecuteAsyncOnStreamImpl(", module_name_, ")"));
   se::DeviceAddressAllocator* const memory_allocator = run_options->allocator();
