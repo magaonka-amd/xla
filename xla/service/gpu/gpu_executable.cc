@@ -1459,6 +1459,20 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
         result.AddAliasedIndex(index);
       }
     }
+    if (ConvZeroDebugEnabled() && !result_buffer.is_null() &&
+        result_buffer.size() > 0 && result_buffer.size() <= 2048) {
+      // [CZ-OUT] the executable's live-out (output) buffer address, logged in
+      // the output-assignment loop which runs in the RUNTIME worker (it precedes
+      // ExecuteThunks, whose convs emit [CZ-CONV] there). Catches example-0's dW
+      // result address (180B) that the executable-tail/PJRT instrumentation
+      // missed; correlate with [CZ-BFC-FREE]/[CZ-BFC] to see if it is freed/
+      // recycled during the loop (use-after-free) vs stays alive (read-before-
+      // write).
+      LOG_FIRST_N(WARNING, 20000)
+          << "[CZ-OUT] module=" << module_name_
+          << " idx=" << index.ToString() << " out=" << result_buffer.opaque()
+          << " size=" << result_buffer.size();
+    }
     buffers_in_result.insert(result_buffer);
   }
 
