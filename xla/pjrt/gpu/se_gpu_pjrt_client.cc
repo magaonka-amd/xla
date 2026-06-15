@@ -2234,6 +2234,53 @@ StreamExecutorGpuClient::RunAsync(
     RETURN_IF_ERROR(set_result({}, 0));
   }
 
+  // [CZ-DEFEV] Targeted diagnostic (gated): classify each input buffer's
+  // definition event to learn WHY the consumer-side WaitForAllocation loop below
+  // was a no-op for example-0's conv inputs. Dual GetDefinitionEvent calls avoid
+  // RTTI and distinguish three cases without touching private state:
+  //   LIVE   = nullptr_if_past=true returns a real pending event -> the wait below
+  //            SHOULD order the producer; if it still failed, suspect a stream
+  //            mismatch (compare run_stream vs compute_stream below).
+  //   PAST   = true->null but false->non-null -> Allocated buffer whose sync_point
+  //            is already evicted/"past" -> the wait is a no-op == hypothesis (b)
+  //            (producer definition event satisfied too early).
+  //   ABSENT = both null -> base-class GetDefinitionEvent (Sliced/Foreign view)
+  //            carries no definition event == hypothesis (a).
+  // NOTE: GetDefinitionEvent(nullptr_if_past=false) may lazily record a HW event;
+  // it perturbs timing slightly and is acceptable for a one-off diagnostic round.
+  if (ConvZeroDebugEnabledSeGpu()) {
+    auto* cz_lds_dev = tensorflow::down_cast<PjRtStreamExecutorDevice*>(device)
+                           ->local_device_state();
+    int cz_argi = 0;
+    for (const auto& arg : flat_arguments) {
+      if (arg.get() == nullptr) {
+        ++cz_argi;
+        continue;
+      }
+      const auto* cz_rb =
+          tensorflow::down_cast<const PjRtStreamExecutorRawBuffer*>(arg.get());
+      const auto& cz_db = cz_rb->device_buffer();
+      auto cz_ev_true =
+          cz_db->GetDefinitionEvent(async_work_runner(), /*nullptr_if_past=*/true);
+      auto cz_ev_false = cz_db->GetDefinitionEvent(async_work_runner(),
+                                                   /*nullptr_if_past=*/false);
+      bool cz_t_present = cz_ev_true.ok() && static_cast<bool>(cz_ev_true.value());
+      bool cz_f_present =
+          cz_ev_false.ok() && static_cast<bool>(cz_ev_false.value());
+      const char* cz_cls =
+          cz_t_present ? "LIVE" : (cz_f_present ? "PAST" : "ABSENT");
+      LOG_FIRST_N(WARNING, 20000)
+          << "[CZ-DEFEV] out_shape=" << gpu_exec->result_shape().ToString()
+          << " argi=" << cz_argi << " in_addr=" << cz_db->opaque()
+          << " in_size=" << cz_db->mem().size() << " class=" << cz_cls
+          << " ev_true_ok=" << cz_ev_true.ok()
+          << " ev_false_ok=" << cz_ev_false.ok()
+          << " run_stream=" << run_options->stream()
+          << " compute_stream=" << cz_lds_dev->compute_stream();
+      ++cz_argi;
+    }
+  }
+
   // [conv-zero FIX] Defensively wait on every input buffer's definition event on
   // the execution stream before running the thunks. CONFIRMED root cause: on the
   // cold first op-by-op iteration the conv read its inputs (x, dy) before the
