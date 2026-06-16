@@ -531,10 +531,13 @@ cc_library(
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@tsl//tsl/platform:numbers",
-    ] + if_cuda_is_configured([
-        # keep sorted
+        # Used by both the CUDA and ROCm autotuning paths (the ROCm conv picker
+        # now does redzone isolation + cross-algorithm correctness comparison,
+        # matching the CUDA path and the ROCm GEMM picker).
         "//xla/backends/gpu/runtime:buffer_comparator",
         "//xla/stream_executor/gpu:redzone_allocator",
+    ] + if_cuda_is_configured([
+        # keep sorted
         "@local_config_cuda//cuda:cudnn_header",
     ]),
 )

@@ -75,6 +75,12 @@ limitations under the License.
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/numbers.h"
 
+// Used by both the CUDA and ROCm autotuning paths for redzone-isolated buffers
+// and cross-algorithm correctness comparison. (The ROCm GEMM picker already uses
+// these unguarded; the ROCm conv picker now does too.)
+#include "xla/backends/gpu/runtime/buffer_comparator.h"
+#include "xla/stream_executor/gpu/redzone_allocator.h"
+
 #if (defined(GOOGLE_CUDA) && GOOGLE_CUDA)
 #include "third_party/gpus/cudnn/cudnn.h"  // IWYU pragma: keep
 #include "third_party/gpus/cudnn/cudnn_version.h"
@@ -83,8 +89,6 @@ limitations under the License.
 #else
 #include "third_party/gpus/cudnn/cudnn_ops_infer.h"
 #endif  // CUDNN_VERSION >= 90000
-#include "xla/backends/gpu/runtime/buffer_comparator.h"
-#include "xla/stream_executor/gpu/redzone_allocator.h"
 #endif
 
 namespace xla {
@@ -1011,58 +1015,50 @@ GpuConvAlgorithmPicker::PickBestAlgorithmNoCacheRocm(
 
   se::StreamExecutor* stream_exec = config_.GetExecutor();
   const auto device_ordinal = stream_exec->device_ordinal();
-  std::vector<se::DeviceMemoryBase> operand_buffers;
 
   // allocator either points to this->allocator_ or, if that's null, to a
   // se::StreamExecutorMemoryAllocator for stream_exec.
   se::DeviceMemoryAllocator* allocator = config_.GetAllocator();
-  ScratchAllocator input_output_allocator(device_ordinal, allocator);
   TF_ASSIGN_OR_RETURN(se::Stream* const stream, config_.GetStream());
-  const auto initialize_buffer = [stream](DeviceMemoryBase buffer) {
-    // Although we don't have evidence this matters, zero out the buffers
-    // before autotuning.  It's conceivable that using uninitialized memory as
-    // the inputs might affect performance if e.g. the inputs contain
-    // denormals, and this is easy enough.
-    return stream->MemZero(&buffer, buffer.size());
-  };
 
-  // Allocate space for the input, filter, and output of the convolution.  We
-  // use a ScratchAllocator for this instead of calling allocator_ directly so
-  // that our allocations don't leak.
-  for (const auto* operand : instr->operands()) {
-    TF_ASSIGN_OR_RETURN(auto buffer,
-                        input_output_allocator.AllocateBytes(
-                            ShapeUtil::ByteSizeOf(operand->shape())));
-    TF_RETURN_IF_ERROR(initialize_buffer(buffer));
-    operand_buffers.push_back(buffer);
-  }
+  const DebugOptions& debug_options = instr->GetModule()->config().debug_options();
+  // Whether to run the correctness/redzone checks. Gated on autotune level >= 4,
+  // matching the CUDA path and ShouldCheckConv(). When false, RedzoneBuffers uses
+  // a redzone size of 0, so buffers behave like plain (unpadded) allocations.
+  const bool check_conv = ShouldCheckConv(hlo_config);
 
+  // Allocate the input/filter/output buffers through a RedzoneAllocator (padded
+  // with redzones when checking is enabled), mirroring the CUDA path and the
+  // ROCm GEMM picker. Previously the ROCm conv path used a plain ScratchAllocator
+  // with no redzones and no cross-algorithm correctness comparison; the
+  // convolution autotuner is therefore the only ROCm autotuner without buffer
+  // isolation or correctness checks. See conv_algorithm_picker.cc CUDA path and
+  // gemm_algorithm_picker.cc for the analogous logic.
+  TF_ASSIGN_OR_RETURN(
+      RedzoneBuffers rz_buffers,
+      RedzoneBuffers::FromInstruction(
+          *instr, config_, debug_options,
+          RedzoneBuffers::kAllInputsOutputsNoScratch));
+
+  // GetMIOpenAlgorithms / RunGpuConv take mutable spans; copy the (cheap) device
+  // memory handles out of the (const) RedzoneBuffers accessors.
+  std::vector<se::DeviceMemoryBase> operand_buffers(
+      rz_buffers.input_buffers().begin(), rz_buffers.input_buffers().end());
   std::vector<se::DeviceMemoryBase> result_buffers(
-      instr->shape().tuple_shapes_size());
-  if (instr->shape().IsTuple()) {
-    for (int i = 0; i < instr->shape().tuple_shapes_size(); ++i) {
-      TF_ASSIGN_OR_RETURN(
-          result_buffers[i],
-          input_output_allocator.AllocateBytes(
-              ShapeUtil::ByteSizeOf(instr->shape().tuple_shapes(i))));
-      TF_RETURN_IF_ERROR(initialize_buffer(result_buffers[i]));
-    }
-  } else {
-    TF_ASSIGN_OR_RETURN(
-        result_buffers[0],
-        input_output_allocator.AllocateBytes(
-            ShapeUtil::ByteSizeOf(instr->shape().tuple_shapes(0))));
-    TF_RETURN_IF_ERROR(initialize_buffer(result_buffers[0]));
-  }
+      rz_buffers.output_buffers().begin(), rz_buffers.output_buffers().end());
 
-  ScratchAllocator scratch_allocator(device_ordinal, allocator);
+  // Scratch allocator used only to enumerate the MIOpen solvers (the "find" step
+  // may allocate candidate workspaces). Per-candidate profiling scratch is
+  // allocated separately below from a RedzoneAllocator.
+  ScratchAllocator find_scratch_allocator(device_ordinal, allocator);
 
   TF_ASSIGN_OR_RETURN(
       std::vector<std::unique_ptr<const se::dnn::ConvRunner>> runners,
       GetMIOpenAlgorithms(instr, absl::MakeSpan(operand_buffers),
                           absl::MakeSpan(result_buffers), stream_exec,
-                          &scratch_allocator, stream, numeric_options));
+                          &find_scratch_allocator, stream, numeric_options));
 
+  const std::string instr_str = instr->ToString();
   std::vector<AutotuneResult> profile_results;
   // If using TF_ROCM_USE_IMMEDIATE_MODE but user doesn't want autotuning, choose the first
   // algo.
@@ -1082,6 +1078,10 @@ GpuConvAlgorithmPicker::PickBestAlgorithmNoCacheRocm(
         tsl::proto_utils::ToDurationProto(absl::Milliseconds(-1));
   } else {
     TF_ASSIGN_OR_RETURN(GpuConvConfig config, GetGpuConvConfig(instr));
+    // First algorithm with a valid result becomes the reference for the
+    // cross-algorithm correctness comparison (as on the CUDA path; any algorithm
+    // suffices, this does not by itself mark it "correct").
+    std::optional<ReferenceResult> reference_result;
     for (auto& runner : runners) {
       TF_ASSIGN_OR_RETURN(auto alg, runner->ToAlgorithmDesc());
       XLA_SCOPED_LOGGING_TIMER_LEVEL(
@@ -1090,12 +1090,25 @@ GpuConvAlgorithmPicker::PickBestAlgorithmNoCacheRocm(
           2);
 
       se::dnn::ProfileResult profile_result;
-      VLOG(4) << "Trying algorithm " << alg.ToString() << " for "
-              << instr->ToString();
+      VLOG(4) << "Trying algorithm " << alg.ToString() << " for " << instr_str;
 
-      TF_ASSIGN_OR_RETURN(
-          DeviceMemoryBase scratch_memory,
-          scratch_allocator.AllocateBytes(runner->GetWorkspaceSize()));
+      // Per-candidate redzone-padded scratch (fresh allocation per algorithm),
+      // isolating each candidate's workspace instead of sharing one plain
+      // allocator across all of them.
+      se::RedzoneAllocator scratch_allocator(
+          stream, allocator,
+          /*memory_limit=*/std::numeric_limits<int64_t>::max(),
+          /*redzone_size=*/check_conv
+              ? debug_options.xla_gpu_redzone_padding_bytes()
+              : 0);
+
+      auto scratch_or = scratch_allocator.AllocateBytes(runner->GetWorkspaceSize());
+      if (!scratch_or.ok()) {
+        VLOG(4) << "Scratch allocation failed for " << alg.ToString() << ": "
+                << scratch_or.status();
+        continue;
+      }
+      DeviceMemoryBase scratch_memory = scratch_or.value();
 
       TF_ASSIGN_OR_RETURN(auto lazy_runner,
                           se::dnn::LazyOpRunner<se::dnn::ConvOp>::FromOpRunner(
@@ -1123,16 +1136,98 @@ GpuConvAlgorithmPicker::PickBestAlgorithmNoCacheRocm(
       AutotuneResult& result = profile_results.back();
       *result.mutable_algorithm() = alg.ToProto();
 
-      int64_t scratch_bytes_used = scratch_allocator.TotalAllocatedBytes();
-      result.set_scratch_bytes(scratch_bytes_used);
+      // RedzoneAllocator only exposes the excluding-redzones total; with
+      // redzone_size==0 (check_conv false) this equals the raw allocation size.
+      result.set_scratch_bytes(
+          scratch_allocator.TotalAllocatedBytesExcludingRedzones());
       *result.mutable_run_time() = tsl::proto_utils::ToDurationProto(
           absl::Milliseconds(profile_result.elapsed_time_in_ms()));
+
+      // Diagnostic: log the live autotune buffer addresses so they can be
+      // correlated with the runtime executable's buffer assignment when chasing
+      // the example-0 zeroed-output aliasing hypothesis.
+      VLOG(3) << "ROCm conv autotune " << alg.ToString() << " buffers: out[0]="
+              << result_buffers[0].opaque() << " in[0]="
+              << operand_buffers[0].opaque() << " scratch="
+              << scratch_memory.opaque();
+
+      if (!check_conv) {
+        continue;
+      }
+
+      // Check for out-of-bounds writes into the input/output and scratch
+      // redzones.
+      TF_ASSIGN_OR_RETURN(
+          bool io_redzone_clear,
+          CheckRedzones(rz_buffers.RedzoneAllocator(), stream, "input/output",
+                        instr_str, &result));
+      TF_ASSIGN_OR_RETURN(
+          bool scratch_redzone_clear,
+          CheckRedzones(scratch_allocator, stream, "scratch", instr_str,
+                        &result));
+      if (!io_redzone_clear || !scratch_redzone_clear) {
+        // CheckRedzones recorded the failure on `result`; don't compare a
+        // result produced by an OOB-writing algorithm.
+        continue;
+      }
+
+      // Cross-algorithm correctness comparison against the first good result.
+      if (reference_result.has_value()) {
+        XLA_SCOPED_LOGGING_TIMER_LEVEL("BufferComparator::CompareEqual", 2);
+        for (int i = 0; i < result_buffers.size(); ++i) {
+          Shape output_shape =
+              MaybeTupleElementShape(rz_buffers.output_shape(), i);
+          BufferComparator comparator(
+              output_shape, debug_options.xla_gpu_autotune_gemm_rtol());
+          absl::StatusOr<bool> compare_result = comparator.CompareEqual(
+              stream, reference_result->buffers[i], result_buffers[i]);
+          if (!compare_result.ok()) {
+            LOG(ERROR) << "Unable to compare "
+                       << reference_result->algorithm.ToString() << " against "
+                       << alg.ToString() << " for " << instr_str << ": "
+                       << compare_result.status();
+            if (compare_result.status().code() ==
+                absl::StatusCode::kResourceExhausted) {
+              // Possibly OOM. Propagate the error.
+              return compare_result.status();
+            }
+            CHECK(!debug_options.xla_gpu_crash_on_verification_failures());
+          } else if (!compare_result.value()) {
+            LOG(ERROR)
+                << "Results mismatch between different convolution algorithms "
+                   "on ROCm. This is likely a bug/unexpected loss of precision "
+                   "in MIOpen.\n"
+                << instr_str << " for " << reference_result->algorithm.ToString()
+                << " vs " << alg.ToString();
+            PrintPlatformInfo(stream);
+            auto* fail = result.mutable_failure();
+            fail->set_kind(AutotuneResult::WRONG_RESULT);
+            fail->set_buffer_address(
+                reinterpret_cast<uint64_t>(result_buffers[i].opaque()));
+            *fail->mutable_reference_algorithm() =
+                reference_result->algorithm.ToProto();
+          }
+        }
+      } else {
+        XLA_SCOPED_LOGGING_TIMER_LEVEL("Memcpy Reference Result", 2);
+        std::vector<DeviceMemoryBase> reference_result_buffers(
+            result_buffers.size());
+        for (int i = 0; i < result_buffers.size(); ++i) {
+          TF_ASSIGN_OR_RETURN(
+              reference_result_buffers[i],
+              rz_buffers.RedzoneAllocator().AllocateBytes(
+                  result_buffers[i].size()));
+          TF_RETURN_IF_ERROR(stream->Memcpy(&reference_result_buffers[i],
+                                            result_buffers[i],
+                                            result_buffers[i].size()));
+        }
+        reference_result = {alg, reference_result_buffers};
+      }
     }
   }
 
   TF_ASSIGN_OR_RETURN(AutotuneResult selected_algorithm,
-                      PickBestResult(profile_results, instr->ToString(),
-                                     hlo_config));
+                      PickBestResult(profile_results, instr_str, hlo_config));
   return selected_algorithm;
 }
 

@@ -108,14 +108,14 @@ class GpuConvAlgorithmPicker : public HloModulePass {
   absl::StatusOr<AutotuneResult> PickBestAlgorithmNoCache(
       const HloCustomCallInstruction* instr);
 
-#if (defined(GOOGLE_CUDA) && GOOGLE_CUDA)
   // Simple bundle of an algorithm and its output, for comparing results across
-  // autotuned algorithms.
+  // autotuned algorithms. Used by both the CUDA and ROCm autotuning paths.
   struct ReferenceResult {
     stream_executor::dnn::AlgorithmDesc algorithm;
     std::vector<stream_executor::DeviceMemoryBase> buffers;
   };
 
+#if (defined(GOOGLE_CUDA) && GOOGLE_CUDA)
   // Execution environment for autotuning. Runtime autotuning requires runtime
   // information such as input/output buffers in order to run. It can be
   // constructed from the autotuned instruction by FromInstruction.
